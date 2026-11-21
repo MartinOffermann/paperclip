@@ -280,19 +280,22 @@ impl NamedExecutableSnapshot {
             "paperclip-verified-executable-{}",
             Uuid::new_v4().simple()
         ));
-        fs::create_dir(&staging_root).map_err(|error| {
-            snapshot_error(display_path, format!("create staging root: {error}"))
-        })?;
+        // Create with the private mode in the mkdir operation itself. Creating
+        // with the process umask and chmod'ing afterward leaves a window where
+        // another user can enumerate and enter a permissive temp directory.
+        rustix::fs::mkdir(&staging_root, Mode::RUSR | Mode::WUSR | Mode::XUSR).map_err(
+            |error| snapshot_error(display_path, format!("create staging root: {error}")),
+        )?;
         let mut staging_guard = ExecutableStagingGuard {
             root: staging_root.clone(),
             armed: true,
         };
-        fs::set_permissions(&staging_root, fs::Permissions::from_mode(0o700)).map_err(|error| {
-            snapshot_error(display_path, format!("secure staging root: {error}"))
-        })?;
         let staging_metadata = fs::symlink_metadata(&staging_root)
             .map_err(|error| snapshot_error(display_path, error))?;
-        if !staging_metadata.is_dir() || staging_metadata.permissions().mode() & 0o077 != 0 {
+        if !staging_metadata.is_dir()
+            || staging_metadata.permissions().mode() & 0o077 != 0
+            || staging_metadata.uid() != rustix::process::geteuid().as_raw()
+        {
             return Err(snapshot_error(
                 display_path,
                 "could not secure executable staging directory",
