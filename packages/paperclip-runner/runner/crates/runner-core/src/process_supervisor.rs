@@ -697,7 +697,7 @@ impl Drop for TemporaryExecutable {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
         if let Some(directory) = &self.cleanup_directory {
-            let _ = fs::remove_dir(directory);
+            let _ = fs::remove_dir_all(directory);
         }
     }
 }
@@ -793,37 +793,81 @@ fn materialize_executable_at(
 }
 
 #[cfg(target_os = "macos")]
+fn create_private_executable_staging(
+    artifact: &VerifiedProcessArtifact,
+) -> Result<(PathBuf, PathBuf), LocalRunnerError> {
+    let source_parent = verified_executable_parent(artifact)?;
+    let staging_root = std::env::temp_dir().join(format!(
+        "paperclip-verified-executable-{}",
+        Uuid::new_v4().simple()
+    ));
+    rustix::fs::mkdir(
+        &staging_root,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR | rustix::fs::Mode::XUSR,
+    )
+    .map_err(|error| {
+        snapshot_error(
+            &artifact.display_path,
+            format!("create staging root: {error}"),
+        )
+    })?;
+    let mut guard = ExecutableStagingGuard {
+        root: staging_root.clone(),
+        armed: true,
+    };
+    let metadata = fs::symlink_metadata(&staging_root)
+        .map_err(|error| snapshot_error(&artifact.display_path, error))?;
+    if !metadata.is_dir()
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+    {
+        return Err(snapshot_error(
+            &artifact.display_path,
+            "could not secure executable staging directory",
+        ));
+    }
+    let bin = staging_root.join("bin");
+    fs::create_dir(&bin).map_err(|error| snapshot_error(&artifact.display_path, error))?;
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o700))
+        .map_err(|error| snapshot_error(&artifact.display_path, error))?;
+    let loader_lib = source_parent.join("../lib");
+    if loader_lib.is_dir() {
+        let target = fs::canonicalize(loader_lib)
+            .map_err(|error| snapshot_error(&artifact.display_path, error))?;
+        std::os::unix::fs::symlink(target, staging_root.join("lib"))
+            .map_err(|error| snapshot_error(&artifact.display_path, error))?;
+    }
+    guard.armed = false;
+    Ok((staging_root, bin))
+}
+
+#[cfg(target_os = "macos")]
 fn materialize_executable(
     artifact: &VerifiedProcessArtifact,
 ) -> Result<TemporaryExecutable, LocalRunnerError> {
-    let directory = verified_executable_parent(artifact)?;
-    let path = directory.join(format!(
-        ".paperclip-verified-executable-{}",
-        Uuid::new_v4().simple()
-    ));
-    materialize_executable_at(artifact, path, None)
+    let (staging_root, bin) = create_private_executable_staging(artifact)?;
+    let path = bin.join("launch");
+    match materialize_executable_at(artifact, path, Some(staging_root.clone())) {
+        Ok(executable) => Ok(executable),
+        Err(error) => {
+            let _ = fs::remove_dir_all(staging_root);
+            Err(error)
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
 fn materialize_bound_executable(
     artifact: &VerifiedProcessArtifact,
 ) -> Result<TemporaryExecutable, LocalRunnerError> {
-    let parent = verified_executable_parent(artifact)?;
-    let directory = parent.join(format!(
-        ".paperclip-verified-executable-{}",
-        Uuid::new_v4().simple()
-    ));
-    fs::create_dir(&directory).map_err(|error| snapshot_error(&artifact.display_path, error))?;
-    if let Err(error) = fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)) {
-        let _ = fs::remove_dir(&directory);
-        return Err(snapshot_error(&artifact.display_path, error));
+    let (staging_root, bin) = create_private_executable_staging(artifact)?;
+    match materialize_executable_at(artifact, bin.join("launch"), Some(staging_root.clone())) {
+        Ok(executable) => Ok(executable),
+        Err(error) => {
+            let _ = fs::remove_dir_all(staging_root);
+            Err(error)
+        }
     }
-    let result =
-        materialize_executable_at(artifact, directory.join("launch"), Some(directory.clone()));
-    if result.is_err() {
-        let _ = fs::remove_dir(directory);
-    }
-    result
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2253,11 +2297,14 @@ mod tests {
         let command = PathBuf::from(&inherited.args[0]);
         let private_directory = command.parent().unwrap().to_path_buf();
         assert_eq!(command.file_name().unwrap(), "launch");
+        assert_eq!(private_directory.file_name().unwrap(), "bin");
         assert!(private_directory
+            .parent()
+            .unwrap()
             .file_name()
             .unwrap()
             .to_string_lossy()
-            .starts_with(".paperclip-verified-executable-"));
+            .starts_with("paperclip-verified-executable-"));
         assert_eq!(
             fs::symlink_metadata(&private_directory)
                 .unwrap()
