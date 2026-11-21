@@ -130,6 +130,7 @@ describe("managed install commands", () => {
         fs.writeFileSync(path.join(checkout, "cli", "package.json"), JSON.stringify({ version: "0.3.1" }));
         fs.mkdirSync(path.join(checkout, "scripts"), { recursive: true });
         fs.writeFileSync(path.join(checkout, "scripts", "release-package-manifest.json"), JSON.stringify(packages.map(({ dir, name }) => ({ dir, name }))));
+        fs.mkdirSync(path.join(checkout, "skills", "fixture"), { recursive: true });
         for (const workspacePackage of packages) {
           fs.mkdirSync(path.join(checkout, workspacePackage.dir), { recursive: true });
           fs.writeFileSync(path.join(checkout, workspacePackage.dir, "package.json"), JSON.stringify(workspacePackage.packageJson));
@@ -152,6 +153,12 @@ describe("managed install commands", () => {
         return { stdout: "", stderr: "" };
       }
       if (file === "bash") return { stdout: "", stderr: "" };
+      if (file === "cp" && args[0] === "-R") {
+        const checkout = _options?.cwd;
+        if (typeof checkout !== "string") throw new Error("Expected checkout cwd for skill copy");
+        fs.cpSync(path.join(checkout, args[1]!), path.join(checkout, args[2]!), { recursive: true });
+        return { stdout: "", stderr: "" };
+      }
       if (file === "npm" && args[0] === "pack") {
         const packageName = args[1]?.includes("workspace-package-") ? "paperclipai-db" : "paperclipai";
         fs.writeFileSync(path.join(args[args.indexOf("--pack-destination") + 1], `${packageName}-0.3.1.tgz`), "package");
@@ -160,8 +167,8 @@ describe("managed install commands", () => {
       if (file === "npm" && args[0] === "install") { const prefix = args[args.indexOf("--prefix") + 1]; const packageRoot = path.join(prefix, "node_modules", "paperclipai"); fs.mkdirSync(path.join(packageRoot, "dist"), { recursive: true }); fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ version: "0.3.1" })); fs.writeFileSync(path.join(packageRoot, "dist", "index.js"), "#!/usr/bin/env node\n"); return { stdout: "", stderr: "" }; }
       if (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs")) {
         const checkout = _options?.cwd;
-        if (typeof checkout !== "string" || !fs.existsSync(path.join(checkout, "server", "ui-dist"))) {
-          throw new Error("server/ui-dist must be prepared before bundled package staging");
+        if (typeof checkout !== "string" || !fs.existsSync(path.join(checkout, "server", "ui-dist")) || !fs.existsSync(path.join(checkout, "server", "skills"))) {
+          throw new Error("server/ui-dist and server/skills must be prepared before bundled package staging");
         }
         fs.mkdirSync(args[2], { recursive: true });
         fs.writeFileSync(path.join(args[2], "package.json"), JSON.stringify({ name: "@paperclipai/db", version: "0.3.1" }));
@@ -186,9 +193,14 @@ describe("managed install commands", () => {
     expect(prepareUiCall?.[1]).toEqual(["pnpm", "--filter", "@paperclipai/server", "run", "prepare:ui-dist"]);
     expect(prepareUiCall?.[2]?.env?.PAPERCLIP_RELEASE_REUSE_UI_DIST).toBe("1");
     expect(runCommand.mock.calls.indexOf(prepareUiCall!)).toBeLessThan(bundleCallIndex);
+    const copySkillsCall = runCommand.mock.calls.find(([command, args]) => command === "cp" && args[0] === "-R");
+    expect(copySkillsCall?.[1]).toEqual(["-R", "skills", "server/skills"]);
+    expect(runCommand.mock.calls.indexOf(copySkillsCall!)).toBeLessThan(bundleCallIndex);
     expect(runCommand.mock.calls.filter(([command, args]) => command === "corepack" && args.includes("pack"))).toHaveLength(2);
     expect(runCommand.mock.calls.filter(([command, args]) => command === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs"))).toHaveLength(1);
     expect(runCommand.mock.calls.filter(([command, args]) => command === "npm" && args[0] === "pack")).toHaveLength(2);
+    const bundledPackCall = runCommand.mock.calls.find(([command, args]) => command === "npm" && args[0] === "pack" && args[1]?.includes("workspace-package-"));
+    expect(bundledPackCall?.[1]).toContain("--ignore-scripts");
     const installCall = runCommand.mock.calls.find(([command, args]) => command === "npm" && args[0] === "install");
     expect(installCall?.[1].filter((arg) => arg.endsWith(".tgz"))).toHaveLength(4);
   });
