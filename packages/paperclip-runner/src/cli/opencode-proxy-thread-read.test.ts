@@ -18,7 +18,10 @@ async function startProxy(root: string, proxy: string, executable: string, runti
   const launchRoot = join(root, `.paperclip-verified-executable-${randomUUID().replaceAll("-", "")}`);
   await mkdir(launchRoot, { mode: 0o700 });
   await chmod(launchRoot, 0o700);
-  const snapshot = join(launchRoot, "launch");
+  const bin = join(launchRoot, "bin");
+  await mkdir(bin, { mode: 0o700 });
+  await chmod(bin, 0o700);
+  const snapshot = join(bin, "launch");
   await copyFile(executable, snapshot);
   await chmod(snapshot, 0o500);
   expect(await readFile(snapshot)).toEqual(await readFile(executable));

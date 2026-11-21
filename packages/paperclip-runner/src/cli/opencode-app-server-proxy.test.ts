@@ -32,12 +32,14 @@ describe("OpenCode runnerd proxy executable", () => {
     if (process.platform === "win32") return;
     if (process.platform === "darwin") {
       const root = mkdtempSync(join(tmpdir(), "paperclip-opencode-nested-"));
-      const directory = join(
+      const privateRoot = join(
         root,
         ".paperclip-verified-executable-0123456789abcdef0123456789abcdef",
       );
+      const directory = join(privateRoot, "bin");
       const command = join(directory, "launch");
       try {
+        mkdirSync(privateRoot, { mode: 0o700 });
         mkdirSync(directory, { mode: 0o700 });
         writeFileSync(command, "#!/bin/sh\nprintf verified-nested-spawn\n");
         chmodSync(command, 0o500);
@@ -65,6 +67,7 @@ describe("OpenCode runnerd proxy executable", () => {
           binding.commandLifecycle!.afterExit();
           expect(() => lstatSync(command)).toThrow();
           expect(() => lstatSync(directory)).toThrow();
+          expect(() => lstatSync(privateRoot)).toThrow();
         }
       } finally {
         rmSync(root, { recursive: true, force: true });
@@ -101,17 +104,86 @@ describe("OpenCode runnerd proxy executable", () => {
   });
 
   it("fails closed instead of accepting an ambient command fallback", () => {
-    expect(() => trustedOpenCodeLaunchBinding([]))
-      .toThrow("refusing ambient PATH or PAPERCLIP_OPENCODE_COMMAND fallback");
-    expect(() => trustedOpenCodeLaunchBinding([
-      TRUSTED_OPENCODE_EXECUTABLE_ARG,
-      "/tmp/unqualified-opencode",
-    ])).toThrow("runner-owned executable binding is unavailable");
-    expect(() => trustedOpenCodeLaunchBinding([
-      TRUSTED_OPENCODE_EXECUTABLE_ARG,
-      "/proc/self/fd/7",
-      "unexpected",
-    ])).toThrow("runner-owned executable binding is unavailable");
+    const previousPath = process.env.PATH;
+    const previousOverride = process.env.PAPERCLIP_OPENCODE_COMMAND;
+    process.env.PATH = "/tmp/untrusted-bin";
+    process.env.PAPERCLIP_OPENCODE_COMMAND = "/tmp/untrusted-opencode";
+    try {
+      expect(() => trustedOpenCodeLaunchBinding([]))
+        .toThrow("refusing ambient PATH or PAPERCLIP_OPENCODE_COMMAND fallback");
+      expect(() => trustedOpenCodeLaunchBinding([
+        TRUSTED_OPENCODE_EXECUTABLE_ARG,
+        "/tmp/unqualified-opencode",
+      ])).toThrow("runner-owned executable binding is unavailable");
+      expect(() => trustedOpenCodeLaunchBinding([
+        TRUSTED_OPENCODE_EXECUTABLE_ARG,
+        "/proc/self/fd/7",
+        "unexpected",
+      ])).toThrow("runner-owned executable binding is unavailable");
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      if (previousOverride === undefined) delete process.env.PAPERCLIP_OPENCODE_COMMAND;
+      else process.env.PAPERCLIP_OPENCODE_COMMAND = previousOverride;
+    }
+  });
+
+  it("accepts only the Runner private-root/bin/launch shape on macOS", () => {
+    if (process.platform !== "darwin") return;
+    const root = mkdtempSync(join(tmpdir(), "paperclip-opencode-binding-"));
+    const privateRoot = join(root, ".paperclip-verified-executable-0123456789abcdef0123456789abcdef");
+    const bin = join(privateRoot, "bin");
+    const executable = join(bin, "launch");
+    const malformed = [
+      join(privateRoot, "launch"),
+      join(bin, "other"),
+      join(root, "bin", "launch"),
+    ];
+    try {
+      mkdirSync(privateRoot, { mode: 0o700 });
+      mkdirSync(bin, { mode: 0o700 });
+      writeFileSync(executable, "#!/bin/sh\nexit 0\n");
+      chmodSync(executable, 0o500);
+      for (const command of malformed) {
+        expect(() => trustedOpenCodeLaunchBinding([
+          TRUSTED_OPENCODE_EXECUTABLE_ARG,
+          command,
+        ])).toThrow("runner-owned executable binding is unavailable");
+      }
+      const binding = trustedOpenCodeLaunchBinding([
+        TRUSTED_OPENCODE_EXECUTABLE_ARG,
+        executable,
+      ]);
+      binding.commandLifecycle!.beforeSpawn();
+      binding.commandLifecycle!.afterExit();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves unexpected private-root entries untouched during cleanup", () => {
+    if (process.platform !== "darwin") return;
+    const root = mkdtempSync(join(tmpdir(), "paperclip-opencode-cleanup-"));
+    const privateRoot = join(root, ".paperclip-verified-executable-0123456789abcdef0123456789abcdef");
+    const bin = join(privateRoot, "bin");
+    const executable = join(bin, "launch");
+    const unrelated = join(privateRoot, "keep-me");
+    try {
+      mkdirSync(privateRoot, { mode: 0o700 });
+      mkdirSync(bin, { mode: 0o700 });
+      writeFileSync(executable, "#!/bin/sh\nexit 0\n");
+      chmodSync(executable, 0o500);
+      const binding = trustedOpenCodeLaunchBinding([
+        TRUSTED_OPENCODE_EXECUTABLE_ARG,
+        executable,
+      ]);
+      binding.commandLifecycle!.beforeSpawn();
+      writeFileSync(unrelated, "preserve");
+      expect(() => binding.commandLifecycle!.afterExit()).toThrow();
+      expect(lstatSync(unrelated).isFile()).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it("removes the ambient override from the launched provider environment", () => {
