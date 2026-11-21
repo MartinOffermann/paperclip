@@ -7,12 +7,14 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
+  readlinkSync,
   readSync,
   rmdirSync,
+  symlinkSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
-import { basename, dirname, isAbsolute } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 
 export const TRUSTED_OPENCODE_EXECUTABLE_ARG =
   "--paperclip-trusted-opencode-executable";
@@ -52,24 +54,42 @@ export function trustedOpenCodeLaunchBinding(
   if (matched && Number.isInteger(commandFd) && commandFd >= 3 && commandFd <= 255) {
     return { command, commandFd };
   }
+  const privateRoot = dirname(dirname(command));
+  const binDirectory = dirname(command);
+  let loaderLinkTarget: string | undefined;
   const validateMacSnapshot = (expected?: { dev: number; ino: number }) => {
     let snapshotIsValid = false;
     let metadata: ReturnType<typeof lstatSync> | undefined;
     try {
       metadata = lstatSync(command);
-      const directoryMetadata = lstatSync(dirname(command));
+      const binMetadata = lstatSync(binDirectory);
+      const rootMetadata = lstatSync(privateRoot);
+      let loaderLinkIsValid = loaderLinkTarget === undefined;
+      try {
+        const loaderMetadata = lstatSync(join(privateRoot, "lib"));
+        loaderLinkIsValid = loaderLinkTarget !== undefined &&
+          loaderMetadata.isSymbolicLink() &&
+          readlinkSync(join(privateRoot, "lib")) === loaderLinkTarget;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
       const currentUid = process.getuid?.();
       snapshotIsValid =
         metadata.isFile() &&
         !metadata.isSymbolicLink() &&
         metadata.nlink === 1 &&
         (metadata.mode & 0o777) === 0o500 &&
-        directoryMetadata.isDirectory() &&
-        !directoryMetadata.isSymbolicLink() &&
-        (directoryMetadata.mode & 0o777) === 0o700 &&
+        binMetadata.isDirectory() &&
+        !binMetadata.isSymbolicLink() &&
+        (binMetadata.mode & 0o777) === 0o700 &&
+        rootMetadata.isDirectory() &&
+        !rootMetadata.isSymbolicLink() &&
+        (rootMetadata.mode & 0o777) === 0o700 &&
+        loaderLinkIsValid &&
         currentUid !== undefined &&
         metadata.uid === currentUid &&
-        directoryMetadata.uid === currentUid &&
+        binMetadata.uid === currentUid &&
+        rootMetadata.uid === currentUid &&
         (expected === undefined ||
           (metadata.dev === expected.dev && metadata.ino === expected.ino));
     } catch {
@@ -85,11 +105,18 @@ export function trustedOpenCodeLaunchBinding(
   if (
     process.platform === "darwin" &&
     isAbsolute(command) &&
+    command === join(privateRoot, "bin", "launch") &&
     basename(command) === "launch" &&
-    /^\.paperclip-verified-executable-[0-9a-f]{32}$/.test(
-      basename(dirname(command)),
-    )
+    basename(binDirectory) === "bin" &&
+    /^\.paperclip-verified-executable-[0-9a-f]{32}$/.test(basename(privateRoot))
   ) {
+    try {
+      const loaderMetadata = lstatSync(join(privateRoot, "lib"));
+      if (!loaderMetadata.isSymbolicLink()) throw new Error("verified OpenCode loader link changed");
+      loaderLinkTarget = readlinkSync(join(privateRoot, "lib"));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
     const initialMetadata = validateMacSnapshot();
     let sourceFd: number;
     try {
@@ -111,7 +138,6 @@ export function trustedOpenCodeLaunchBinding(
     }
     try {
       unlinkSync(command);
-      rmdirSync(dirname(command));
     } catch (error) {
       closeSync(sourceFd);
       throw error;
@@ -123,10 +149,38 @@ export function trustedOpenCodeLaunchBinding(
         throw new Error("Verified OpenCode executable is still in use");
       }
       let destinationFd: number | undefined;
+      let destinationIdentity: { dev: number; ino: number } | undefined;
       try {
-        mkdirSync(dirname(command), { mode: 0o700 });
-        chmodSync(dirname(command), 0o700);
+        try {
+          mkdirSync(privateRoot, { mode: 0o700 });
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        }
+        const rootMetadata = lstatSync(privateRoot);
+        if (
+          !rootMetadata.isDirectory() || rootMetadata.isSymbolicLink() ||
+          (rootMetadata.mode & 0o777) !== 0o700 || rootMetadata.uid !== process.getuid?.()
+        ) throw new Error("verified OpenCode private root changed");
+        if (loaderLinkTarget) {
+          try {
+            symlinkSync(loaderLinkTarget, join(privateRoot, "lib"));
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+          }
+        }
+        try {
+          mkdirSync(binDirectory, { mode: 0o700 });
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        }
+        const binMetadata = lstatSync(binDirectory);
+        if (
+          !binMetadata.isDirectory() || binMetadata.isSymbolicLink() ||
+          (binMetadata.mode & 0o777) !== 0o700 || binMetadata.uid !== process.getuid?.()
+        ) throw new Error("verified OpenCode bin directory changed");
         destinationFd = openSync(command, "wx", 0o700);
+        const created = fstatSync(destinationFd);
+        destinationIdentity = { dev: created.dev, ino: created.ino };
         const buffer = Buffer.allocUnsafe(64 * 1024);
         let sourceOffset = 0;
         while (sourceOffset < sourceMetadata.size) {
@@ -155,8 +209,7 @@ export function trustedOpenCodeLaunchBinding(
         }
         fsyncSync(destinationFd);
         chmodSync(command, 0o500);
-        const copied = fstatSync(destinationFd);
-        materializedIdentity = { dev: copied.dev, ino: copied.ino };
+        materializedIdentity = destinationIdentity;
         closeSync(destinationFd);
         destinationFd = undefined;
         materialized = true;
@@ -164,13 +217,18 @@ export function trustedOpenCodeLaunchBinding(
       } catch (error) {
         if (destinationFd !== undefined) closeSync(destinationFd);
         try {
-          unlinkSync(command);
+          if (destinationIdentity) {
+            const current = lstatSync(command);
+            if (
+              current.isFile() && !current.isSymbolicLink() && current.nlink === 1 &&
+              current.dev === destinationIdentity.dev && current.ino === destinationIdentity.ino
+            ) unlinkSync(command);
+          }
         } catch {
-          // Best-effort cleanup; the private directory removal below remains
-          // fail-closed if another entry appeared.
+          // Preserve unexpected or substituted directory entries.
         }
         try {
-          rmdirSync(dirname(command));
+          rmdirSync(binDirectory);
         } catch {
           // Preserve the original materialization failure.
         }
@@ -194,7 +252,18 @@ export function trustedOpenCodeLaunchBinding(
           if (!materialized) return;
           validateMacSnapshot(materializedIdentity);
           unlinkSync(command);
-          rmdirSync(dirname(command));
+          rmdirSync(binDirectory);
+          const loaderLink = join(privateRoot, "lib");
+          try {
+            const loaderMetadata = lstatSync(loaderLink);
+            if (
+              loaderLinkTarget !== undefined && loaderMetadata.isSymbolicLink() &&
+              readlinkSync(loaderLink) === loaderLinkTarget
+            ) unlinkSync(loaderLink);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          }
+          rmdirSync(privateRoot);
           materialized = false;
           materializedIdentity = undefined;
         },
