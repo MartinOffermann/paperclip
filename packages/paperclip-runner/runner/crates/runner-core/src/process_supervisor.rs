@@ -77,7 +77,7 @@ impl VerifiedProcessArtifact {
     }
 
     /// Executable snapshots need a named image on Darwin. Construct that image
-    /// once, beside the source runtime for loader-relative shared libraries.
+    /// once in private staging, preserving loader-relative library resolution.
     pub fn snapshot_verified_executable(
         display_path: PathBuf,
         file: File,
@@ -132,6 +132,23 @@ struct NamedExecutablePath {
     basename: std::ffi::OsString,
     device: u64,
     inode: u64,
+    staging_root: PathBuf,
+    loader_lib: Option<PathBuf>,
+}
+
+#[cfg(target_os = "macos")]
+struct ExecutableStagingGuard {
+    root: PathBuf,
+    armed: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for ExecutableStagingGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -162,6 +179,21 @@ impl NamedExecutablePath {
             || visible_parent.permissions().mode() & 0o022 != 0
         {
             return Err(snapshot_error(&self.path, "executable parent changed"));
+        }
+        let staging = fs::symlink_metadata(&self.staging_root)
+            .map_err(|error| snapshot_error(&self.path, error))?;
+        if !staging.is_dir() || staging.permissions().mode() & 0o077 != 0 {
+            return Err(snapshot_error(
+                &self.path,
+                "executable staging directory changed",
+            ));
+        }
+        if let Some(target) = &self.loader_lib {
+            let actual = fs::read_link(self.staging_root.join("lib"))
+                .map_err(|error| snapshot_error(&self.path, error))?;
+            if actual != *target {
+                return Err(snapshot_error(&self.path, "loader library link changed"));
+            }
         }
         let image = self.open_image()?;
         let metadata = image
@@ -197,6 +229,13 @@ impl Drop for NamedExecutablePath {
                 }
             }
         }
+        if self.loader_lib.is_some() {
+            let _ = fs::remove_file(self.staging_root.join("lib"));
+        }
+        if let Some(bin) = self.path.parent() {
+            let _ = fs::remove_dir(bin);
+        }
+        let _ = fs::remove_dir(&self.staging_root);
     }
 }
 
@@ -217,18 +256,18 @@ impl NamedExecutableSnapshot {
         expected_sha256: &str,
     ) -> Result<Self, LocalRunnerError> {
         use rustix::fs::{open, openat, Mode, OFlags};
-        let parent_path = display_path
+        let source_parent_path = display_path
             .parent()
             .ok_or_else(|| snapshot_error(display_path, "executable has no parent"))?;
-        let parent = File::from(
+        let source_parent = File::from(
             open(
-                parent_path,
+                source_parent_path,
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             )
             .map_err(|error| snapshot_error(display_path, error))?,
         );
-        let parent_metadata = parent
+        let parent_metadata = source_parent
             .metadata()
             .map_err(|error| snapshot_error(display_path, error))?;
         if parent_metadata.permissions().mode() & 0o022 != 0 {
@@ -237,11 +276,63 @@ impl NamedExecutableSnapshot {
                 "executable parent is group- or world-writable",
             ));
         }
+        let staging_root = std::env::temp_dir().join(format!(
+            "paperclip-verified-executable-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir(&staging_root).map_err(|error| {
+            snapshot_error(display_path, format!("create staging root: {error}"))
+        })?;
+        let mut staging_guard = ExecutableStagingGuard {
+            root: staging_root.clone(),
+            armed: true,
+        };
+        fs::set_permissions(&staging_root, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            snapshot_error(display_path, format!("secure staging root: {error}"))
+        })?;
+        let staging_metadata = fs::symlink_metadata(&staging_root)
+            .map_err(|error| snapshot_error(display_path, error))?;
+        if !staging_metadata.is_dir() || staging_metadata.permissions().mode() & 0o077 != 0 {
+            return Err(snapshot_error(
+                display_path,
+                "could not secure executable staging directory",
+            ));
+        }
+        let loader_lib = {
+            let candidate = source_parent_path.join("../lib");
+            if candidate.is_dir() {
+                Some(fs::canonicalize(candidate).map_err(|error| {
+                    snapshot_error(
+                        display_path,
+                        format!("resolve loader library directory: {error}"),
+                    )
+                })?)
+            } else {
+                None
+            }
+        };
+        let bin_path = staging_root.join("bin");
+        fs::create_dir(&bin_path).map_err(|error| {
+            snapshot_error(display_path, format!("create staging bin: {error}"))
+        })?;
+        if let Some(target) = &loader_lib {
+            std::os::unix::fs::symlink(target, staging_root.join("lib")).map_err(|error| {
+                snapshot_error(display_path, format!("create loader library link: {error}"))
+            })?;
+        }
+        let parent = File::from(
+            open(
+                &bin_path,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|error| snapshot_error(display_path, format!("open staging bin: {error}")))?,
+        );
         let basename = std::ffi::OsString::from(format!(
             ".paperclip-verified-executable-{}",
             Uuid::new_v4().simple()
         ));
-        let path = parent_path.join(&basename);
+        let path = bin_path.join(&basename);
         let mut writable = File::from(
             openat(
                 &parent,
@@ -249,7 +340,9 @@ impl NamedExecutableSnapshot {
                 OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::RUSR | Mode::WUSR | Mode::XUSR,
             )
-            .map_err(|error| snapshot_error(display_path, error))?,
+            .map_err(|error| {
+                snapshot_error(display_path, format!("create staged executable: {error}"))
+            })?,
         );
         // If fstat itself fails, ownership cannot be proven. Fail closed and
         // leave the randomized entry rather than unlink a possibly substituted
@@ -263,7 +356,10 @@ impl NamedExecutableSnapshot {
             basename,
             device: metadata.dev(),
             inode: metadata.ino(),
+            staging_root,
+            loader_lib,
         };
+        staging_guard.armed = false;
         copy_verified(source, &mut writable, display_path, expected_sha256)?;
         writable
             .sync_all()
@@ -1794,18 +1890,6 @@ mod tests {
                 )
                 .unwrap()
             }
-            fn image_count(&self) -> usize {
-                fs::read_dir(&self.directory)
-                    .unwrap()
-                    .filter_map(Result::ok)
-                    .filter(|entry| {
-                        entry
-                            .file_name()
-                            .to_string_lossy()
-                            .starts_with(".paperclip-verified-executable-")
-                    })
-                    .count()
-            }
         }
         impl Drop for Fixture {
             fn drop(&mut self) {
@@ -1824,22 +1908,55 @@ mod tests {
             fs::write(&source, b"replacement source inode").unwrap();
             fs::remove_file(&source).unwrap();
             executable.validate_before_spawn().unwrap();
-            assert_eq!(
-                executable.image.path.parent(),
-                Some(fixture.directory.as_path())
-            );
-            assert_eq!(fixture.image_count(), 1);
+            let staging_bin = executable.image.path.parent().unwrap().to_owned();
+            assert_ne!(staging_bin, fixture.directory);
+            let image_path = executable.image.path.clone();
+            assert!(image_path.exists());
+            assert_eq!(fs::read_dir(&staging_bin).unwrap().count(), 1);
             let launch = VerifiedProcessLaunch::new(artifact, vec![]);
             let inherited = launch.inherited_command().unwrap();
-            assert_eq!(
-                fixture.image_count(),
-                1,
-                "admission must not materialize another image"
+            assert!(
+                image_path.exists(),
+                "admission must retain the existing image"
             );
+            assert_eq!(fs::read_dir(&staging_bin).unwrap().count(), 1);
             assert_eq!(
                 fs::read(&inherited.program).unwrap(),
                 b"authenticated executable bytes"
             );
+        }
+
+        #[test]
+        fn read_only_executable_directory_uses_private_staging_and_cleans_up() {
+            let fixture = Fixture::new();
+            let source_dir = fixture.directory.join("read-only-bin");
+            fs::create_dir(&source_dir).unwrap();
+            let source = source_dir.join("node");
+            fs::write(&source, b"authenticated executable bytes").unwrap();
+            fs::set_permissions(&source_dir, fs::Permissions::from_mode(0o555)).unwrap();
+            let artifact = VerifiedProcessArtifact::snapshot_verified_executable(
+                source.clone(),
+                File::open(&source).unwrap(),
+                &format!(
+                    "sha256:{:x}",
+                    Sha256::digest(b"authenticated executable bytes")
+                ),
+            )
+            .unwrap();
+            let snapshot = artifact.executable.as_ref().unwrap();
+            let staging_root = snapshot.image.staging_root.clone();
+            assert_ne!(snapshot.image.path.parent(), Some(source_dir.as_path()));
+            assert_eq!(
+                snapshot.image.path.parent().unwrap().parent(),
+                Some(snapshot.image.staging_root.as_path())
+            );
+            assert_eq!(
+                fs::metadata(&source_dir).unwrap().permissions().mode() & 0o777,
+                0o555
+            );
+            drop(artifact);
+            assert!(!staging_root.exists());
+            fs::set_permissions(&source_dir, fs::Permissions::from_mode(0o700)).unwrap();
         }
 
         #[test]
@@ -1939,9 +2056,17 @@ mod tests {
             )
             .unwrap();
             let path = artifact.executable.as_ref().unwrap().image.path.clone();
-            let retired = fixture.directory.join("retired-runtime");
-            fs::rename(&parent, &retired).unwrap();
-            fs::create_dir(&parent).unwrap();
+            let staging_root = artifact
+                .executable
+                .as_ref()
+                .unwrap()
+                .image
+                .staging_root
+                .clone();
+            let image_parent = path.parent().unwrap().to_owned();
+            let retired = staging_root.join("retired-bin");
+            fs::rename(&image_parent, &retired).unwrap();
+            fs::create_dir(&image_parent).unwrap();
             fs::write(&path, b"replacement parent image").unwrap();
             assert!(artifact
                 .executable
@@ -1952,6 +2077,10 @@ mod tests {
             drop(artifact);
             assert_eq!(fs::read(&path).unwrap(), b"replacement parent image");
             assert!(!retired.join(path.file_name().unwrap()).exists());
+            fs::remove_file(&path).unwrap();
+            fs::remove_dir(&image_parent).unwrap();
+            fs::remove_dir(&retired).unwrap();
+            fs::remove_dir_all(&staging_root).unwrap();
         }
 
         #[test]
@@ -1991,7 +2120,6 @@ mod tests {
                 "sha256:wrong"
             )
             .is_err());
-            assert_eq!(fixture.image_count(), 0);
             let launch = VerifiedProcessLaunch::new(fixture.artifact(), vec![]);
             let inherited = launch.inherited_command().unwrap();
             let path = inherited.program.clone();
