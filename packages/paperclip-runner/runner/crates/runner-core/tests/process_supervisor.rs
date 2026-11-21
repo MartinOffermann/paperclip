@@ -125,8 +125,9 @@ fn verified_launch_uses_open_command_and_script_after_atomic_path_replacement() 
     assert!(inherited_runtime.starts_with("/proc/self/fd/"));
     #[cfg(target_os = "macos")]
     {
-        assert!(inherited_runtime.contains(".paperclip-verified-executable-"));
-        assert_eq!(Path::new(&inherited_runtime).parent(), command.parent());
+        assert!(inherited_runtime.contains("paperclip-verified-executable-"));
+        assert_ne!(Path::new(&inherited_runtime).parent(), command.parent());
+        assert_eq!(Path::new(&inherited_runtime).file_name().unwrap(), "launch");
     }
     assert_eq!(
         process
@@ -234,6 +235,62 @@ mod darwin_executable_role {
             assert!(Instant::now() < deadline, "verified child did not exit");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn executable_artifact_launch_uses_private_staging_for_read_only_source() {
+        let directory = OwnedDirectory::new();
+        let source_dir = directory.0.join("read-only-bin");
+        fs::create_dir(&source_dir).unwrap();
+        let source = source_dir.join("nested-command");
+        write_executable(&source, "#!/bin/sh\nprintf '%s\\n' nested-launch-ok\n");
+        fs::set_permissions(&source_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let shell = directory.0.join("verified-shell");
+        let shell_contents = "#!/bin/sh\nprintf 'nested path %s\\n' \"$1\"\nexec \"$1\"\n";
+        write_executable(&shell, shell_contents);
+        let launch = VerifiedProcessLaunch::new(
+            VerifiedProcessArtifact::snapshot_verified(
+                shell.clone(),
+                File::open(&shell).unwrap(),
+                &sha256(shell_contents),
+            )
+            .unwrap(),
+            vec![VerifiedProcessArgument::ExecutableArtifact(
+                VerifiedProcessArtifact::snapshot_verified(
+                    source.clone(),
+                    File::open(&source).unwrap(),
+                    &sha256_file(&source),
+                )
+                .unwrap(),
+            )],
+        );
+        let mut process = SupervisedProcess::spawn_verified_with_environment_keys(
+            &launch,
+            Duration::from_millis(50),
+            1024,
+            &[],
+        )
+        .expect("nested executable should launch from private staging");
+        let staged_path = process
+            .receive_stdout_line(Duration::from_secs(2))
+            .unwrap()
+            .expect("parent shell should report nested executable path");
+        assert!(staged_path.contains("paperclip-verified-executable-"));
+        assert!(!staged_path.contains(source_dir.to_str().unwrap()));
+        assert_eq!(
+            process
+                .receive_stdout_line(Duration::from_secs(2))
+                .unwrap()
+                .as_deref(),
+            Some("nested-launch-ok")
+        );
+        wait_for_success(&mut process);
+        assert_eq!(
+            fs::metadata(&source_dir).unwrap().permissions().mode() & 0o777,
+            0o555
+        );
+        assert_eq!(fs::read_dir(&source_dir).unwrap().count(), 1);
     }
 
     #[test]
