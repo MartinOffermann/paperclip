@@ -447,18 +447,23 @@ test("bundled package staging materializes publishConfig entrypoints", () => {
   assert.deepEqual(staged.exports, adapterUtilsPackage.publishConfig.exports);
 });
 
-test("bundled package staging materializes workspace dependency versions", () => {
-  const staged = materializePublishManifest({
-    name: "@paperclipai/example",
-    version: "2026.723.0",
+test("bundled package staging uses each workspace dependency's own version", (t) => {
+  const sourceRoot = realpathSync(mkdtempSync(join(tmpdir(), "paperclip-workspace-versions-")));
+  t.after(() => rmSync(sourceRoot, { recursive: true, force: true }));
+  const writeManifest = (path, manifest) => {
+    mkdirSync(join(sourceRoot, path), { recursive: true });
+    writeFileSync(join(sourceRoot, path, "package.json"), JSON.stringify(manifest));
+  };
+  writeManifest("packages/example", {
+    name: "@paperclipai/example", version: "2026.723.0",
     dependencies: { exact: "workspace:*", caret: "workspace:^", tilde: "workspace:~" },
   });
+  writeManifest("packages/exact", { name: "exact", version: "1.4.2" });
+  writeManifest("packages/caret", { name: "caret", version: "0.8.1" });
+  writeManifest("packages/tilde", { name: "tilde", version: "3.2.0" });
 
-  assert.deepEqual(staged.dependencies, {
-    exact: "2026.723.0",
-    caret: "^2026.723.0",
-    tilde: "~2026.723.0",
-  });
+  const staged = materializePublishManifest(JSON.parse(readFileSync(join(sourceRoot, "packages/example/package.json"))), { sourceRoot });
+  assert.deepEqual(staged.dependencies, { exact: "1.4.2", caret: "^0.8.1", tilde: "~3.2.0" });
 });
 
 test("bundled package staging installs only dependencies included in the tarball", () => {

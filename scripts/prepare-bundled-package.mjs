@@ -9,9 +9,28 @@ import { fileURLToPath } from "node:url";
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const nativeTargets = ["linux-x64", "darwin-arm64", "darwin-x64"];
 
-export function materializePublishManifest(pkg) {
+function workspacePackageVersions(sourceRoot) {
+  const versions = new Map();
+  const visit = (directory) => {
+    if (!existsSync(directory)) return;
+    const manifestPath = resolve(directory, "package.json");
+    if (existsSync(manifestPath)) {
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+      if (typeof manifest.name === "string" && typeof manifest.version === "string") versions.set(manifest.name, manifest.version);
+      return;
+    }
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      if (entry.isDirectory() && entry.name !== "node_modules" && entry.name !== "dist" && entry.name !== ".git") visit(resolve(directory, entry.name));
+    }
+  };
+  for (const root of ["packages", "server", "ui", "cli"]) visit(resolve(sourceRoot, root));
+  return versions;
+}
+
+export function materializePublishManifest(pkg, { sourceRoot = repoRoot } = {}) {
   const publishConfig = pkg.publishConfig ?? {};
   const publishManifest = { ...pkg };
+  const workspaceVersions = workspacePackageVersions(sourceRoot);
 
   for (const key of ["main", "types", "exports", "bin"]) {
     if (publishConfig[key] !== undefined) publishManifest[key] = publishConfig[key];
@@ -24,7 +43,9 @@ export function materializePublishManifest(pkg) {
         if (typeof specifier !== "string" || !specifier.startsWith("workspace:")) return [name, specifier];
         const range = specifier.slice("workspace:".length);
         const prefix = range === "^" || range === "~" ? range : "";
-        return [name, `${prefix}${pkg.version}`];
+        const version = workspaceVersions.get(name);
+        if (!version) throw new Error(`Cannot resolve workspace dependency ${name} from ${pkg.name}`);
+        return [name, `${prefix}${version}`];
       }),
     );
   }
