@@ -1076,6 +1076,46 @@ describe("OpenCodeServerDriver", () => {
     }
   });
 
+  it("forwards OpenCode session affinity and unwraps only a single root allOf tool schema", async () => {
+    const received: Array<{ session?: string; body: Record<string, unknown>; length: string }> = [];
+    const upstream = createHttpServer((request, response) => {
+      void (async () => {
+        const chunks: Buffer[] = [];
+        for await (const chunk of request) chunks.push(Buffer.from(chunk));
+        const bytes = Buffer.concat(chunks);
+        received.push({ session: request.headers["x-opencode-session"] as string, body: JSON.parse(bytes.toString("utf8")), length: request.headers["content-length"] as string });
+        response.writeHead(200, { "content-type": "text/event-stream" }).end("data: [DONE]\n\n");
+      })().catch(() => response.destroy());
+    });
+    await new Promise<void>(resolve => upstream.listen(0, "127.0.0.1", resolve));
+    const address = upstream.address();
+    if (!address || typeof address === "string") throw new Error("Missing fixture address");
+    const root = await mkdtemp(join(tmpdir(), "paperclip-opencode-affinity-")); roots.push(root);
+    let session: Awaited<ReturnType<OpenCodeServerDriver["openSession"]>> | undefined;
+    try {
+      const driver = new OpenCodeServerDriver({ model: "paperclip/team/model", runtimeDirectory: root, command: fixture,
+        environment: { PATH: process.env.PATH, PAPERCLIP_AI_PROVIDER_URL: `http://127.0.0.1:${address.port}/v1`, PAPERCLIP_AI_PROVIDER_KEY: "key" } });
+      session = await driver.openSession({ runId: "affinity", normalizedSessionId: "harness-session", workingDirectory: root });
+      const config = JSON.parse(await readFile(join(root, "harness-session", "config", "opencode", "opencode.json"), "utf8"));
+      const { baseURL, apiKey } = config.provider.paperclip.options;
+      const headers = { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" };
+      const schema = { allOf: [{ type: "object", properties: { value: { type: "string", minLength: 2 } }, required: ["value"], additionalProperties: false }] };
+      const payload = { model: "team/model", stream: true, messages: [{ role: "user", content: "test" }], tools: [{ type: "function", function: { name: "tool", parameters: schema } }] };
+      for (const affinityHeaders of [{}, { "x-opencode-session": "explicit", "x-opencode-session-id": "alias", "x-session-affinity": "affinity" }, { "x-opencode-session-id": "alias", "x-session-affinity": "affinity" }]) {
+        const result = await fetch(`${baseURL}/chat/completions`, { method: "POST", headers: { ...headers, ...affinityHeaders }, body: JSON.stringify(payload) });
+        expect(result.status).toBe(200);
+        await result.text();
+      }
+      expect(received.map(item => item.session)).toEqual(["harness-session", "explicit", "alias"]);
+      expect(received[0]!.body.tools).toEqual([{ type: "function", function: { name: "tool", parameters: schema.allOf[0] } }]);
+      expect(Number(received[0]!.length)).toBe(Buffer.byteLength(JSON.stringify(received[0]!.body)));
+      expect((received[0]!.body.tools as Array<{ function: { parameters: Record<string, unknown> } }>)[0]!.function.parameters.properties).toEqual(schema.allOf[0]!.properties);
+    } finally {
+      await session?.close({ reason: "test" });
+      await new Promise<void>(resolve => { upstream.close(() => resolve()); upstream.closeAllConnections(); });
+    }
+  });
+
   it.each(["gateway-key", ""])("forwards selected-model streams without exposing the reusable key and revokes the proxy on close (%s)", async key => {
     const received: Array<{ path: string; authorization?: string; body: unknown }> = [];
     const upstream = createHttpServer((request, response) => {
