@@ -19,6 +19,12 @@ import { basename, dirname, isAbsolute, join } from "node:path";
 export const TRUSTED_OPENCODE_EXECUTABLE_ARG =
   "--paperclip-trusted-opencode-executable";
 
+const unavailableBinding = (reason: string) => new Error(
+  `OpenCode ${QUALIFIED_OPENCODE_VERSION} runner-owned executable binding is unavailable (${reason}); refusing ambient PATH or PAPERCLIP_OPENCODE_COMMAND fallback`,
+);
+const permissionBits = (mode: number | bigint) =>
+  Number(typeof mode === "bigint" ? mode & 0o777n : mode & 0o777);
+
 export function withoutAmbientOpenCodeCommand(
   environment: NodeJS.ProcessEnv,
 ): NodeJS.ProcessEnv {
@@ -96,19 +102,62 @@ export function trustedOpenCodeLaunchBinding(
       snapshotIsValid = false;
     }
     if (!snapshotIsValid) {
-      throw new Error(
-        `OpenCode ${QUALIFIED_OPENCODE_VERSION} runner-owned executable binding is unavailable; refusing ambient PATH or PAPERCLIP_OPENCODE_COMMAND fallback`,
-      );
+      // Stable predicate names only: paths, ownership values, inode values,
+      // symlink targets, and raw filesystem errors can contain sensitive data.
+      const reasons: string[] = [];
+      if (!metadata) reasons.push("executable_metadata_unavailable");
+      else {
+        if (!metadata.isFile()) reasons.push("executable_not_regular_file");
+        if (metadata.isSymbolicLink()) reasons.push("executable_is_symlink");
+        if (metadata.nlink !== 1) reasons.push("executable_link_count");
+        if (permissionBits(metadata.mode) !== 0o500) reasons.push("executable_mode");
+      }
+      try {
+        const bin = lstatSync(binDirectory);
+        if (!bin.isDirectory()) reasons.push("bin_not_directory");
+        if (bin.isSymbolicLink()) reasons.push("bin_is_symlink");
+        if (permissionBits(bin.mode) !== 0o700) reasons.push("bin_mode");
+        if (bin.uid !== process.getuid?.()) reasons.push("bin_owner");
+      } catch { reasons.push("bin_metadata_unavailable"); }
+      try {
+        const root = lstatSync(privateRoot);
+        if (!root.isDirectory()) reasons.push("private_root_not_directory");
+        if (root.isSymbolicLink()) reasons.push("private_root_is_symlink");
+        if (permissionBits(root.mode) !== 0o700) reasons.push("private_root_mode");
+        if (root.uid !== process.getuid?.()) reasons.push("private_root_owner");
+      } catch { reasons.push("private_root_metadata_unavailable"); }
+      try {
+        const linkPath = join(privateRoot, "lib");
+        const link = lstatSync(linkPath);
+        if (
+          loaderLinkTarget === undefined || !link.isSymbolicLink() ||
+          readlinkSync(linkPath) !== loaderLinkTarget
+        ) reasons.push("loader_link");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT" || loaderLinkTarget !== undefined) {
+          reasons.push("loader_link");
+        }
+      }
+      const currentUid = process.getuid?.();
+      if (currentUid === undefined) reasons.push("effective_uid_unavailable");
+      else if (metadata && metadata.uid !== currentUid) reasons.push("executable_owner");
+      if (expected && metadata && (metadata.dev !== expected.dev || metadata.ino !== expected.ino)) {
+        reasons.push("executable_identity");
+      }
+      throw unavailableBinding(reasons.join(",") || "snapshot_validation");
     }
     return metadata!;
   };
+  const macPathFailures = [
+    [isAbsolute(command), "executable_path_not_absolute"],
+    [command === join(privateRoot, "bin", "launch"), "executable_path_structure"],
+    [basename(command) === "launch", "executable_name"],
+    [basename(binDirectory) === "bin", "bin_directory_name"],
+    [/^\.?paperclip-verified-executable-[0-9a-f]{32}$/.test(basename(privateRoot)), "private_root_name"],
+  ] as const;
   if (
     process.platform === "darwin" &&
-    isAbsolute(command) &&
-    command === join(privateRoot, "bin", "launch") &&
-    basename(command) === "launch" &&
-    basename(binDirectory) === "bin" &&
-    /^\.paperclip-verified-executable-[0-9a-f]{32}$/.test(basename(privateRoot))
+    macPathFailures.every(([valid]) => valid)
   ) {
     try {
       const loaderMetadata = lstatSync(join(privateRoot, "lib"));
@@ -122,9 +171,7 @@ export function trustedOpenCodeLaunchBinding(
     try {
       sourceFd = openSync(command, "r");
     } catch {
-      throw new Error(
-        `OpenCode ${QUALIFIED_OPENCODE_VERSION} runner-owned executable binding is unavailable; refusing ambient PATH or PAPERCLIP_OPENCODE_COMMAND fallback`,
-      );
+      throw unavailableBinding("executable_open_failed");
     }
     const sourceMetadata = fstatSync(sourceFd);
     if (
@@ -132,9 +179,7 @@ export function trustedOpenCodeLaunchBinding(
       sourceMetadata.ino !== initialMetadata.ino
     ) {
       closeSync(sourceFd);
-      throw new Error(
-        `OpenCode ${QUALIFIED_OPENCODE_VERSION} runner-owned executable binding is unavailable; refusing ambient PATH or PAPERCLIP_OPENCODE_COMMAND fallback`,
-      );
+      throw unavailableBinding("executable_identity");
     }
     try {
       unlinkSync(command);
@@ -270,7 +315,12 @@ export function trustedOpenCodeLaunchBinding(
       },
     };
   }
-  throw new Error(
-    `OpenCode ${QUALIFIED_OPENCODE_VERSION} runner-owned executable binding is unavailable; refusing ambient PATH or PAPERCLIP_OPENCODE_COMMAND fallback`,
-  );
+  const reason = args.length !== 2 || args[0] !== TRUSTED_OPENCODE_EXECUTABLE_ARG
+    ? "binding_arguments"
+    : process.platform !== "darwin" && process.platform !== "linux"
+      ? "unsupported_platform"
+      : process.platform === "darwin"
+        ? macPathFailures.find(([valid]) => !valid)?.[1] ?? "macos_path_shape"
+        : "linux_descriptor_shape";
+  throw unavailableBinding(reason);
 }
