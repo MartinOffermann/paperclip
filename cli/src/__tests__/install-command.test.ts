@@ -137,6 +137,12 @@ describe("managed install commands", () => {
         return { stdout: "", stderr: "" };
       }
       if (file === "corepack") {
+        if (args.includes("prepare:ui-dist")) {
+          const checkout = _options?.cwd;
+          if (typeof checkout !== "string") throw new Error("Expected checkout cwd for UI preparation");
+          fs.mkdirSync(path.join(checkout, "server", "ui-dist"), { recursive: true });
+          return { stdout: "", stderr: "" };
+        }
         if (args.includes("pack")) {
           const destination = args[args.indexOf("--pack-destination") + 1];
           const packageDir = args[args.indexOf("--dir") + 1];
@@ -153,6 +159,10 @@ describe("managed install commands", () => {
       }
       if (file === "npm" && args[0] === "install") { const prefix = args[args.indexOf("--prefix") + 1]; const packageRoot = path.join(prefix, "node_modules", "paperclipai"); fs.mkdirSync(path.join(packageRoot, "dist"), { recursive: true }); fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ version: "0.3.1" })); fs.writeFileSync(path.join(packageRoot, "dist", "index.js"), "#!/usr/bin/env node\n"); return { stdout: "", stderr: "" }; }
       if (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs")) {
+        const checkout = _options?.cwd;
+        if (typeof checkout !== "string" || !fs.existsSync(path.join(checkout, "server", "ui-dist"))) {
+          throw new Error("server/ui-dist must be prepared before bundled package staging");
+        }
         fs.mkdirSync(args[2], { recursive: true });
         fs.writeFileSync(path.join(args[2], "package.json"), JSON.stringify({ name: "@paperclipai/db", version: "0.3.1" }));
         return { stdout: "", stderr: "" };
@@ -171,6 +181,11 @@ describe("managed install commands", () => {
     expect(manifest?.payloadPath).toContain(path.join("git", sha.slice(0, 12)));
     expect(runCommand.mock.calls.filter(([command, args]) => command === "curl" && args.includes("--output"))).toHaveLength(1);
     expect(runCommand.mock.calls.filter(([command, args]) => command === "corepack" && args[1] === "install")).toHaveLength(1);
+    const prepareUiCall = runCommand.mock.calls.find(([command, args]) => command === "corepack" && args.includes("prepare:ui-dist"));
+    const bundleCallIndex = runCommand.mock.calls.findIndex(([command, args]) => command === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs"));
+    expect(prepareUiCall?.[1]).toEqual(["pnpm", "--filter", "@paperclipai/server", "run", "prepare:ui-dist"]);
+    expect(prepareUiCall?.[2]?.env?.PAPERCLIP_RELEASE_REUSE_UI_DIST).toBe("1");
+    expect(runCommand.mock.calls.indexOf(prepareUiCall!)).toBeLessThan(bundleCallIndex);
     expect(runCommand.mock.calls.filter(([command, args]) => command === "corepack" && args.includes("pack"))).toHaveLength(2);
     expect(runCommand.mock.calls.filter(([command, args]) => command === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs"))).toHaveLength(1);
     expect(runCommand.mock.calls.filter(([command, args]) => command === "npm" && args[0] === "pack")).toHaveLength(2);
@@ -188,7 +203,7 @@ describe("managed install commands", () => {
       file === "corepack" ||
       (file === "npm" && args[0] === "pack") ||
       (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs")));
-    expect(buildCalls).toHaveLength(9);
+    expect(buildCalls).toHaveLength(10);
     for (const call of buildCalls) {
       const env = call[2]?.env;
       expect(env, `${call[0]} ${call[1].join(" ")} must run with an explicit env`).toBeDefined();
