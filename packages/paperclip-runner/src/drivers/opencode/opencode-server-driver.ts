@@ -409,6 +409,7 @@ export class OpenCodeServerDriver implements HarnessDriver {
       try {
         runtime = await startRuntime({
           options: this.#options,
+          normalizedSessionId: input.normalizedSessionId,
           root,
           cwd,
           trace,
@@ -2526,7 +2527,7 @@ class OpenCodeHarnessSession implements HarnessSession {
 }
 
 /** Retain the reusable gateway key in the runner; the harness gets a session-scoped capability. */
-async function startOpenCodeProviderProxy(baseUrl: string, key: string, model: string, environment: NodeJS.ProcessEnv, onServed?: (served: UpstreamServed | null) => void, secretValues: readonly string[] = []) {
+async function startOpenCodeProviderProxy(baseUrl: string, key: string, model: string, sessionId: string, environment: NodeJS.ProcessEnv, onServed?: (served: UpstreamServed | null) => void, secretValues: readonly string[] = []) {
   const upstreamUrl = new URL(`${baseUrl.replace(/\/+$/, "")}/chat/completions`);
   const token = randomBytes(32).toString("base64url");
   // Agent-local settings keep one runtime's transport configuration out of other sessions.
@@ -2579,6 +2580,38 @@ async function startOpenCodeProviderProxy(baseUrl: string, key: string, model: s
         response.writeHead(400).end();
         return;
       }
+      // OpenCode Go sends several affinity aliases depending on the client
+      // version. Honor its explicit OpenCode session header first, then its
+      // aliases, and finally the stable harness session identity.
+      const affinity = (value: string | string[] | undefined) =>
+        (Array.isArray(value) ? value[0] : value)?.trim();
+      const upstreamSessionId = affinity(request.headers["x-opencode-session"])
+        || affinity(request.headers["x-opencode-session-id"])
+        || affinity(request.headers["x-session-affinity"])
+        || sessionId;
+      // Some Go OpenAI-compatible handlers reject root-level schema metadata
+      // and composition wrappers even though they accept their contained
+      // object schema. Keep nested constraints intact and only unwrap a
+      // single root `allOf` object schema when it has no sibling keywords.
+      const tools = payload.tools;
+      if (Array.isArray(tools)) {
+        let changed = false;
+        for (const tool of tools) {
+          if (!tool || typeof tool !== "object") continue;
+          const fn = (tool as Record<string, unknown>).function;
+          if (!fn || typeof fn !== "object") continue;
+          const parameters = (fn as Record<string, unknown>).parameters;
+          if (!parameters || typeof parameters !== "object" || Array.isArray(parameters)) continue;
+          const schema = parameters as Record<string, unknown>;
+          const keys = Object.keys(schema);
+          if (keys.length === 1 && Array.isArray(schema.allOf) && schema.allOf.length === 1 &&
+            schema.allOf[0] && typeof schema.allOf[0] === "object" && !Array.isArray(schema.allOf[0])) {
+            (fn as Record<string, unknown>).parameters = schema.allOf[0];
+            changed = true;
+          }
+        }
+        if (changed) body = Buffer.from(JSON.stringify(payload), "utf8");
+      }
       // Keep OpenCode's unreadable-media notice attributed to the tool result
       // instead of a synthetic user message the model mistakes for the person.
       if (attributeUnsupportedToolMedia(payload)) body = Buffer.from(JSON.stringify(payload), "utf8");
@@ -2593,7 +2626,7 @@ async function startOpenCodeProviderProxy(baseUrl: string, key: string, model: s
           const outgoing = (upstreamUrl.protocol === "https:" ? requestHttps : requestHttp)(upstreamUrl, {
             method: "POST",
             agent,
-            headers: { ...(isOpenRouterUrl(baseUrl) ? OPENROUTER_ATTRIBUTION_HEADERS : {}), "Content-Type": "application/json", "Content-Length": body.length, ...(key ? { Authorization: `Bearer ${key}` } : {}) },
+            headers: { ...(isOpenRouterUrl(baseUrl) ? OPENROUTER_ATTRIBUTION_HEADERS : {}), "Content-Type": "application/json", "Content-Length": body.length, "x-opencode-session": upstreamSessionId, ...(key ? { Authorization: `Bearer ${key}` } : {}) },
             signal: AbortSignal.any([controller.signal, AbortSignal.timeout(600_000)]),
           }, resolve);
           outgoing.once("error", reject);
@@ -2648,6 +2681,7 @@ async function startOpenCodeProviderProxy(baseUrl: string, key: string, model: s
 
 async function startRuntime(input: {
   options: OpenCodeServerDriverOptions;
+  normalizedSessionId: string;
   root: string;
   cwd: string;
   trace: ProviderTraceFileSink | null;
@@ -2748,7 +2782,7 @@ async function startRuntime(input: {
       ? { baseUrl: input.options.environment.PAPERCLIP_AI_PROVIDER_URL, key: input.options.environment.PAPERCLIP_AI_PROVIDER_KEY ?? "" }
       : null;
   const providerProxy = providerRoute
-    ? await startOpenCodeProviderProxy(providerRoute.baseUrl, providerRoute.key, providerModelId, providerEnvironment, input.onUpstreamServed, outputCustody?.values ?? []).catch(async error => {
+    ? await startOpenCodeProviderProxy(providerRoute.baseUrl, providerRoute.key, providerModelId, input.normalizedSessionId, providerEnvironment, input.onUpstreamServed, outputCustody?.values ?? []).catch(async error => {
         await bridge.close().catch(() => {});
         await removeIsolatedHome(isolatedHome).catch(() => {});
         throw error;
