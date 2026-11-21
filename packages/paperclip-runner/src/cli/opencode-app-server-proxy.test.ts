@@ -34,7 +34,7 @@ describe("OpenCode runnerd proxy executable", () => {
       const root = mkdtempSync(join(tmpdir(), "paperclip-opencode-nested-"));
       const privateRoot = join(
         root,
-        ".paperclip-verified-executable-0123456789abcdef0123456789abcdef",
+        "paperclip-verified-executable-0123456789abcdef0123456789abcdef",
       );
       const directory = join(privateRoot, "bin");
       const command = join(directory, "launch");
@@ -131,7 +131,7 @@ describe("OpenCode runnerd proxy executable", () => {
   it("accepts only the Runner private-root/bin/launch shape on macOS", () => {
     if (process.platform !== "darwin") return;
     const root = mkdtempSync(join(tmpdir(), "paperclip-opencode-binding-"));
-    const privateRoot = join(root, ".paperclip-verified-executable-0123456789abcdef0123456789abcdef");
+    const privateRoot = join(root, "paperclip-verified-executable-0123456789abcdef0123456789abcdef");
     const bin = join(privateRoot, "bin");
     const executable = join(bin, "launch");
     const malformed = [
@@ -150,6 +150,10 @@ describe("OpenCode runnerd proxy executable", () => {
           command,
         ])).toThrow("runner-owned executable binding is unavailable");
       }
+      expect(() => trustedOpenCodeLaunchBinding([
+        TRUSTED_OPENCODE_EXECUTABLE_ARG,
+        join(root, "unqualified-private-root", "bin", "launch"),
+      ])).toThrow("(private_root_name)");
       const binding = trustedOpenCodeLaunchBinding([
         TRUSTED_OPENCODE_EXECUTABLE_ARG,
         executable,
@@ -164,7 +168,7 @@ describe("OpenCode runnerd proxy executable", () => {
   it("leaves unexpected private-root entries untouched during cleanup", () => {
     if (process.platform !== "darwin") return;
     const root = mkdtempSync(join(tmpdir(), "paperclip-opencode-cleanup-"));
-    const privateRoot = join(root, ".paperclip-verified-executable-0123456789abcdef0123456789abcdef");
+    const privateRoot = join(root, "paperclip-verified-executable-0123456789abcdef0123456789abcdef");
     const bin = join(privateRoot, "bin");
     const executable = join(bin, "launch");
     const unrelated = join(privateRoot, "keep-me");
