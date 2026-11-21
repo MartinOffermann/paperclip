@@ -126,11 +126,7 @@ fn verified_launch_uses_open_command_and_script_after_atomic_path_replacement() 
     #[cfg(target_os = "macos")]
     {
         assert!(inherited_runtime.contains(".paperclip-verified-executable-"));
-        assert_eq!(
-            Path::new(&inherited_runtime).parent(),
-            command.parent(),
-            "macOS verified launches must preserve loader-relative runtime layout"
-        );
+        assert_eq!(Path::new(&inherited_runtime).parent(), command.parent());
     }
     assert_eq!(
         process
@@ -161,7 +157,7 @@ fn verified_launch_preserves_homebrew_node_loader_layout() {
     )
     .expect("node path should resolve");
     let launch = VerifiedProcessLaunch::new(
-        VerifiedProcessArtifact::snapshot_verified(
+        VerifiedProcessArtifact::snapshot_verified_executable(
             node.clone(),
             File::open(&node).unwrap(),
             &sha256_file(&node),
@@ -184,10 +180,19 @@ fn verified_launch_preserves_homebrew_node_loader_layout() {
         .receive_stdout_line(Duration::from_secs(2))
         .unwrap()
         .expect("Node should report its executable path");
+    assert_ne!(Path::new(&executed_node).parent(), node.parent());
+    let loader_lib = Path::new(&executed_node)
+        .parent()
+        .unwrap()
+        .join("..")
+        .join("lib");
+    assert!(
+        loader_lib.is_dir(),
+        "staging must provide Node's @loader_path/../lib directory"
+    );
     assert_eq!(
-        Path::new(&executed_node).parent(),
-        node.parent(),
-        "verified Node must execute beside the authenticated runtime"
+        fs::canonicalize(loader_lib).unwrap(),
+        fs::canonicalize(node.parent().unwrap().join("../lib")).unwrap()
     );
     process.wait().unwrap();
 }
@@ -291,7 +296,7 @@ mod darwin_executable_role {
             .receive_stdout_line(Duration::from_secs(1))
             .unwrap()
             .unwrap();
-        assert_eq!(
+        assert_ne!(
             Path::new(&inherited_runtime).parent(),
             Some(directory.0.as_path())
         );
@@ -350,7 +355,12 @@ mod darwin_executable_role {
             .receive_stdout_line(Duration::from_secs(2))
             .unwrap()
             .expect("Node must report executable path");
-        assert_eq!(Path::new(&executed_node).parent(), node.parent());
+        assert_ne!(Path::new(&executed_node).parent(), node.parent());
+        assert_eq!(
+            fs::canonicalize(Path::new(&executed_node).parent().unwrap().join("../lib")).unwrap(),
+            fs::canonicalize(node.parent().unwrap().join("../lib")).unwrap(),
+            "staged Node must resolve its @loader_path/../lib dependency directory"
+        );
         assert!(Path::new(&executed_node)
             .file_name()
             .unwrap()
