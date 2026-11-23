@@ -303,6 +303,10 @@ exports, lifecycle fields or approval routes. Existing HTTP routes enforce their
 company/resource scope, ownership, grants, redaction, run requirements and board
 or approval gates. A board-only route still denies an agent call. Dedicated tools
 remain preferred for common workflows, including native completion and monitors.
+Native reviewers record an execution-stage approval through `call_api` using
+the existing `PATCH /api/issues/{id}` operation with `status: "done"` and the
+decision comment in the same request. The run keeps its lock until
+`paperclip_finish` applies the next-stage handoff.
 
 Ask and pre-acceptance Plan retain their existing read restrictions and specific
 mutation exceptions (task titles and conversational confirmation recording).

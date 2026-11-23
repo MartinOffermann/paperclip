@@ -6,6 +6,7 @@ import { PgDialect } from "drizzle-orm/pg-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
 import type { LogActivityInput } from "../services/activity-log.js";
+import { completionReviewStageEntry } from "../services/issue-execution-policy.js";
 import { hoistModuleGraph } from "./helpers/hoist-module-graph.js";
 import { inboxBlockedActivity } from "../../../tests/runner-e2e/product-journeys/inbox-triage-fixture.js";
 
@@ -3155,7 +3156,7 @@ describe("agent issue mutation checkout ownership", () => {
       status: "running",
       contextSnapshot: { issueId },
     };
-    const runActor = () => ({ ...ownerActor(), source: "agent_jwt" });
+    const runActor = (runId = ownerRunId) => ({ ...ownerActor(), runId, source: "agent_jwt" });
 
     beforeEach(() => {
       mockIssueService.getById.mockResolvedValue(makeIssue({ executionRunId: ownerRunId, checkoutRunId: ownerRunId }));
@@ -3180,15 +3181,16 @@ describe("agent issue mutation checkout ownership", () => {
     });
 
     describe("as the active review participant", () => {
-      const reviewStage = (id: string) => ({ id, type: "review", approvalsNeeded: 1,
-        participants: [{ id: `${id.slice(0, -1)}f`, type: "agent", agentId: ownerAgentId, userId: null }] });
-      const reviewIssue = (stageIds: string[]) => makeIssue({
+      const reviewStage = (id: string, agentId = ownerAgentId, type = "review") => ({ id, type, approvalsNeeded: 1,
+        participants: [{ id: `${id.slice(0, -1)}f`, type: "agent", agentId, userId: null }] });
+      const reviewIssue = (stageIds: string[], sameAgentNextStage = false) => makeIssue({
         status: "in_review", executionRunId: ownerRunId, checkoutRunId: ownerRunId,
-        executionPolicy: { mode: "normal", commentRequired: true, stages: stageIds.map(reviewStage) },
+        executionPolicy: { mode: "normal", commentRequired: true, stages: stageIds.map((id, index) => reviewStage(id,
+          index === 0 || sameAgentNextStage ? ownerAgentId : peerAgentId, index === 0 ? "review" : "approval")) },
         executionState: {
           status: "pending", currentStageId: stageIds[0], currentStageIndex: 0, currentStageType: "review",
           currentParticipant: { type: "agent", agentId: ownerAgentId },
-          returnAssignee: { type: "agent", agentId: peerAgentId },
+          returnAssignee: { type: "agent", agentId: sameAgentNextStage ? peerAgentId : ownerAgentId },
           completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
         },
       });
@@ -3241,15 +3243,105 @@ describe("agent issue mutation checkout ownership", () => {
         expect(mockIssueService.update).not.toHaveBeenCalled();
       });
 
-      it("keeps refusing an intermediate approval that would hand the task to the next participant", async () => {
-        mockIssueService.getById.mockResolvedValue(reviewIssue([finalStage, laterStage]));
+      it("records a two-stage approval under the current lock and hands off once at native finish", async () => {
+        const issue = reviewIssue([finalStage, laterStage]);
+        mockIssueService.getById.mockResolvedValue(issue);
+        mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({ ...issue, ...patch }));
+        const db = createRunContextDb();
+        const inserted: Array<{ table: string; values: Record<string, unknown> }> = [];
+        db.insert = vi.fn((table: Parameters<typeof getTableName>[0]) => ({ values: vi.fn(async (values: Record<string, unknown>) => {
+          inserted.push({ table: getTableName(table), values });
+        }) })) as typeof db.insert;
 
-        const res = await request(createApp(runActor())).patch(`/api/issues/${issueId}`)
-          .send({ status: "done", comment: "Approved." });
+        const res = await request(createApp(runActor(), db)).patch(`/api/issues/${issueId}`)
+          .send({ status: "done", comment: "Approved the first stage." });
 
-        expect(res.status, JSON.stringify(res.body)).toBe(409);
-        expect(res.body.details).toMatchObject({ code: "native_run_status_reported_by_finish", requestedStatus: "done" });
-        expect(mockIssueService.update).not.toHaveBeenCalled();
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        const patch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, any>;
+        expect(patch).not.toHaveProperty("status");
+        expect(patch).not.toHaveProperty("assigneeAgentId");
+        expect(patch.executionState).toMatchObject({ status: "pending", currentStageId: laterStage,
+          currentParticipant: { type: "agent", agentId: peerAgentId }, completedStageIds: [finalStage],
+          lastDecisionOutcome: "approved", lastDecisionId: expect.any(String) });
+        expect(inserted.find(row => row.table === "issue_execution_decisions")?.values).toMatchObject({
+          id: patch.executionState.lastDecisionId, stageId: finalStage, outcome: "approved", actorAgentId: ownerAgentId,
+          createdByRunId: ownerRunId, body: "Approved the first stage.",
+        });
+        expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(peerAgentId,
+          expect.objectContaining({ reason: "execution_approval_requested" }));
+
+        // The existing finish-time transition sees the recorded next stage,
+        // repairs its assignment, and thereafter no longer starts it again.
+        const atFinish = { ...issue, executionState: patch.executionState };
+        const handoff = completionReviewStageEntry(atFinish, ownerAgentId);
+        expect(handoff.kind).toBe("starts");
+        if (handoff.kind !== "starts") throw new Error("Expected the next review stage to start at finish");
+        expect(handoff.patch).toMatchObject({ status: "in_review", assigneeAgentId: peerAgentId,
+          executionState: { currentStageId: laterStage, currentStageType: "approval", currentParticipant: { agentId: peerAgentId } } });
+        expect(completionReviewStageEntry({ ...atFinish, ...handoff.patch }, ownerAgentId).kind).not.toBe("starts");
+      });
+
+      it("treats a repeated approval as a retry when the same agent owns the next stage", async () => {
+        const issue = reviewIssue([finalStage, laterStage], true);
+        let currentIssue: any = issue;
+        mockIssueService.getById.mockImplementation(async () => currentIssue);
+        mockIssueService.getByIdForUpdate.mockImplementation(async () => currentIssue);
+        mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => {
+          currentIssue = { ...currentIssue, ...patch };
+          return currentIssue;
+        });
+        const db = createRunContextDb();
+        const insertedDecisions: Record<string, unknown>[] = [];
+        const select = db.select;
+        db.select = vi.fn((selection: Record<string, unknown> = {}) => ({
+          from: vi.fn((table: Parameters<typeof getTableName>[0]) => {
+            if (getTableName(table) === "issue_execution_decisions") {
+              return { where: vi.fn((condition: SQL) => ({ limit: vi.fn(async () => {
+                const state = currentIssue.executionState as unknown as Record<string, unknown>;
+                const params = new PgDialect().sqlToQuery(condition).params;
+                return insertedDecisions.filter(decision => decision.id === state.lastDecisionId &&
+                  params.includes(decision.createdByRunId as string));
+              }) })) };
+            }
+            return select(selection).from(table);
+          }),
+        })) as typeof db.select;
+        const insert = db.insert as unknown as (table: Parameters<typeof getTableName>[0]) => {
+          values: (values: Record<string, unknown>) => Promise<unknown>;
+        };
+        db.insert = vi.fn((table: Parameters<typeof getTableName>[0]) => ({
+          values: vi.fn(async (values: Record<string, unknown>) => {
+            if (getTableName(table) === "issue_execution_decisions") insertedDecisions.push(values);
+            return insert(table).values(values);
+          }),
+        })) as typeof db.insert;
+
+        const app = createApp(runActor(), db);
+        const first = await request(app).patch(`/api/issues/${issueId}`)
+          .send({ status: "done", comment: "Approved the first stage." });
+        expect(first.status, JSON.stringify(first.body)).toBe(200);
+        expect(insertedDecisions).toHaveLength(1);
+        expect(currentIssue.executionState).toMatchObject({ status: "pending", currentStageId: laterStage,
+          currentParticipant: { type: "agent", agentId: ownerAgentId }, completedStageIds: [finalStage] });
+
+        const retry = await request(app).patch(`/api/issues/${issueId}`)
+          .send({ status: "done", comment: "Retrying the first approval." });
+        expect(retry.status, JSON.stringify(retry.body)).toBe(200);
+        expect(insertedDecisions).toHaveLength(1);
+        expect(currentIssue.executionState).toMatchObject({ status: "pending", currentStageId: laterStage,
+          currentParticipant: { type: "agent", agentId: ownerAgentId }, completedStageIds: [finalStage] });
+
+        const nextRunId = "66666666-6666-4666-8666-666666666666";
+        currentIssue = { ...currentIssue, executionRunId: nextRunId, checkoutRunId: nextRunId };
+        mockHeartbeatService.getRun.mockResolvedValue({ ...nativeRun, id: nextRunId });
+        const nextRun = await request(createApp(runActor(nextRunId), db)).patch(`/api/issues/${issueId}`)
+          .send({ status: "done", comment: "Approved the second stage." });
+        expect(nextRun.status, JSON.stringify(nextRun.body)).toBe(200);
+        expect(insertedDecisions).toHaveLength(2);
+        expect(currentIssue.executionState).toMatchObject({ status: "completed", currentStageId: null,
+          lastDecisionOutcome: "approved" });
+        expect(insertedDecisions[1]).toMatchObject({ stageId: laterStage, outcome: "approved", actorAgentId: ownerAgentId,
+          createdByRunId: nextRunId });
       });
 
       it("keeps refusing the approval when this run is not the active participant", async () => {

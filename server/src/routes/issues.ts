@@ -56,6 +56,7 @@ import { confirmNativeControllerStopped, NATIVE_CONTROLLER_HOST_UNVERIFIED } fro
 import { confirmOwnerGone, OWNER_UNPROVABLE_CAUSE } from "../services/recovery/owner-gone-attestation.js";
 import { OWNABLE_KINDS } from "../services/recovery/ownership-registry.js";
 import { retryNativeWorkspaceExport } from "../services/native-runtime/native-workspace-export-retry.js";
+import { executionStageHandoffApprovedByRun } from "../services/native-runtime/native-execution-stage-handoff.js";
 import { deferredWakeJoinsFirstTurn, firstTurnTakesAllQueuedComments, runAcceptsFirstTurnQueuedInput } from "../services/native-runtime/first-turn-queued-input.js";
 import { reconstructNativeWorkspace, unreconciledNativeExportPredicate } from "../services/native-runtime/native-workspace-reconstruction.js";
 import { reconstructWorkspaceSchema } from "@paperclipai/shared";
@@ -2939,11 +2940,12 @@ function buildExecutionStageWakeup(input: {
   previousState: ParsedExecutionState | null;
   nextState: ParsedExecutionState | null;
   interruptedRunId: string | null;
+  deferToNativeFinalization?: boolean;
   requestedByActorType: "user" | "agent";
   requestedByActorId: string;
 }) {
   const { issueId, previousState, nextState, interruptedRunId } = input;
-  if (!nextState) return null;
+  if (!nextState || input.deferToNativeFinalization) return null;
 
   if (nextState.status === "pending") {
     const agentId =
@@ -14479,15 +14481,16 @@ export function issueRoutes(
    * comment): no runner tool records a stage decision, so refusing it leaves
    * the stage pending forever. With `allowStageApproval` the guard returns
    * "defer_final_status" for that request instead of refusing it. The caller
-   * records the decision and keeps the task (and the run's lock) in review;
-   * the run's own paperclip_finish report then sets the final status.
+   * records the decision and next-stage state while keeping the task's status
+   * and assignee (and therefore the run's lock) in review. Native finalization
+   * applies the already-selected handoff after this run finishes.
    */
   async function assertNativeRunKeepsOwnExecutionLock(
     req: Request,
-    issue: { companyId: string; status: string; parentId: string | null; assigneeAgentId: string | null; assigneeUserId: string | null; checkoutRunId: string | null; executionRunId: string | null; conversationAgentId?: string | null; conversationUserId?: string | null; executionState?: unknown },
+    issue: { id: string; companyId: string; status: string; parentId: string | null; assigneeAgentId: string | null; assigneeUserId: string | null; checkoutRunId: string | null; executionRunId: string | null; conversationAgentId?: string | null; conversationUserId?: string | null; executionState?: unknown },
     requestedStatus: unknown = req.body.status,
     options: { allowStageApproval?: boolean } = {},
-  ): Promise<"defer_final_status" | undefined> {
+  ): Promise<"defer_final_status" | "duplicate_deferred_stage_approval" | undefined> {
     const runId = req.actor.type === "agent" ? req.actor.runId : null;
     if (!runId || !req.actor.agentId || req.actor.agentId !== issue.assigneeAgentId) return;
     if (runId !== issue.executionRunId && runId !== issue.checkoutRunId) return;
@@ -14502,6 +14505,7 @@ export function issueRoutes(
       || run.agentId !== req.actor.agentId || run.companyId !== issue.companyId) return;
     if (options.allowStageApproval && requestedStatus === "done" && issue.status === "in_review" &&
         activeExecutionParticipantAgentId(issue) === req.actor.agentId) {
+      if (await executionStageHandoffApprovedByRun(db, run, issue)) return "duplicate_deferred_stage_approval";
       return "defer_final_status";
     }
     // A blocker that the dependency rules reject anyway keeps its specific
@@ -14633,6 +14637,7 @@ export function issueRoutes(
       if (!existing) return;
       if (!(await assertIssueReadAllowed(req, res, existing))) return;
       const nativeStageApproval = await assertNativeRunKeepsOwnExecutionLock(req, existing, req.body.status, { allowStageApproval: true });
+      const duplicateDeferredStageApproval = nativeStageApproval === "duplicate_deferred_stage_approval";
       if (req.body.expectedStatusVersion !== undefined && (
         existing.statusVersion !== req.body.expectedStatusVersion || existing.status !== "backlog"
       )) {
@@ -14724,6 +14729,7 @@ export function issueRoutes(
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
         ...updateFields
       } = req.body;
+      if (duplicateDeferredStageApproval) delete updateFields.status;
       if (commentBody && req.actor.type === "agent") {
         await assertAgentInteraction(db, { companyId: existing.companyId, actorAgentId: req.actor.agentId,
           operation: "comment", issueId: existing.id, texts: [commentBody] });
@@ -14843,11 +14849,11 @@ export function issueRoutes(
         req.body.reviewPolicy !== existing.reviewPolicy;
       const reviewVerdictRequested =
         existing.status === "in_review" &&
-        (updateFields.status === "done" || updateFields.status === "cancelled");
+        (updateFields.status === "done" || updateFields.status === "cancelled" || duplicateDeferredStageApproval);
       const mcpReviewSensitiveMutation = mcpParticipationChange;
       const reviewPolicySensitiveMutationRequested =
         mcpReviewSensitiveMutation || req.body.reviewPolicy !== undefined ||
-        updateFields.status === "done" ||
+        updateFields.status === "done" || duplicateDeferredStageApproval ||
         updateFields.status === "cancelled";
       if (
         (reviewVerdictRequested || reviewPolicyChangeRequested) &&
@@ -15196,16 +15202,24 @@ export function issueRoutes(
         throw unprocessable("Snapshot-guarded policy updates cannot change task status or ownership");
       }
       Object.assign(updateFields, transition.patch);
-      let deferredNativeStageApproval = false;
+      let deferredNativeStageApproval = nativeStageApproval === "duplicate_deferred_stage_approval";
       if (nativeStageApproval === "defer_final_status") {
-        // Only the final stage's approval is deferred. Anything else this
-        // request would do (an intermediate approval that hands the task to the
-        // next participant, or no decision at all) keeps the ordinary refusal.
-        const finalApproval = transition.decision?.outcome === "approved" && updateFields.status === "done" &&
+        // Keep the current run's assignment lock until finish. For an
+        // intermediate approval, persist the next-stage state now but let the
+        // existing native finalizer repair the assignee and wake that stage.
+        const approvedStage = transition.decision?.outcome === "approved" && req.body.status === "done";
+        const finalApproval = approvedStage && updateFields.status === "done" &&
           (transition.patch.assigneeAgentId === undefined || transition.patch.assigneeAgentId === existing.assigneeAgentId) &&
           transition.patch.assigneeUserId === undefined;
-        if (!finalApproval) throw nativeRunStatusReportedByFinish(req.body.status);
+        const intermediateApproval = approvedStage && transition.workflowControlledAssignment === true &&
+          updateFields.status === "in_review" &&
+          (transition.patch.executionState as { status?: unknown } | undefined)?.status === "pending";
+        if (!finalApproval && !intermediateApproval) throw nativeRunStatusReportedByFinish(req.body.status);
         delete updateFields.status;
+        if (intermediateApproval) {
+          delete updateFields.assigneeAgentId;
+          delete updateFields.assigneeUserId;
+        }
         deferredNativeStageApproval = true;
       }
 
@@ -16581,6 +16595,7 @@ export function issueRoutes(
         previousState: previousExecutionState,
         nextState: nextExecutionState,
         interruptedRunId,
+        deferToNativeFinalization: deferredNativeStageApproval,
         requestedByActorType: actor.actorType,
         requestedByActorId: actor.actorId,
       });

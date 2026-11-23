@@ -2,7 +2,7 @@ import * as pullRequestMerge from "../github-pull-request-merge.js";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agentWakeupRequests, agents, companies, companyMemberships, completionContracts, createDb, heartbeatRuns, issueThreadInteractions, issueWorkProducts, issues, statusDecisions } from "@paperclipai/db";
+import { agentWakeupRequests, agents, companies, companyMemberships, completionContracts, createDb, heartbeatRuns, issueExecutionDecisions, issueThreadInteractions, issueWorkProducts, issues, statusDecisions } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { completionReviewStageEntry } from "../issue-execution-policy.js";
 import { nativeCompletionFeedback } from "./native-completion-feedback.js";
@@ -24,20 +24,31 @@ describe.skipIf(!support.supported)("native completion with a configured review 
   afterAll(async () => { await temporary?.cleanup(); });
 
   type Options = { stage?: "user" | "agent"; monitor?: boolean; liveCycleWithRemovedStage?: boolean; unprovenEvidence?: boolean; earlyReview?: boolean;
-    beforeFinish?: (runId: string, result: PrpStructuredRunResult) => Promise<void> };
+    intermediateApproval?: boolean; intermediateApprovalOwnedByRun?: boolean; sameAgentNextStage?: boolean; beforeFinish?: (runId: string, result: PrpStructuredRunResult) => Promise<void> };
   async function finishVerifiedDone(options: Options = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), runId = randomUUID();
-    const reviewerId = `reviewer-${randomUUID()}`, reviewerAgentId = randomUUID(), stageId = randomUUID();
+    const reviewerId = `reviewer-${randomUUID()}`, reviewerAgentId = randomUUID(), stageId = randomUUID(), nextStageId = randomUUID();
+    const decisionId = options.intermediateApproval ? randomUUID() : null;
     await db.insert(companies).values({ id: companyId, name: "Review stage", issuePrefix: `R${companyId.slice(0, 7)}` });
     await db.insert(agents).values([{ id: agentId, companyId, name: "Worker", adapterType: "paperclip_runner", status: "active" },
       { id: reviewerAgentId, companyId, name: "Reviewer", adapterType: "paperclip_runner", status: "active" }]);
     await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: reviewerId, status: "active", membershipRole: "operator" });
     const participant = options.stage === "agent" ? { id: randomUUID(), type: "agent", agentId: reviewerAgentId } : { id: randomUUID(), type: "user", userId: reviewerId };
     const nextCheckAt = new Date(Date.now() + 3_600_000);
-    await db.insert(issues).values({ id: issueId, companyId, title: "Build the site", status: "in_progress", assigneeAgentId: agentId,
-      ...(options.stage || options.liveCycleWithRemovedStage ? { executionPolicy: { mode: "normal", commentRequired: true,
+    const intermediateStages = options.intermediateApproval ? [
+      { id: stageId, type: "review", approvalsNeeded: 1, participants: [{ id: randomUUID(), type: "agent", agentId }] },
+      { id: nextStageId, type: "approval", approvalsNeeded: 1, participants: [{ id: randomUUID(), type: "agent", agentId: options.sameAgentNextStage ? agentId : reviewerAgentId }] },
+    ] : null;
+    const executionPolicy = intermediateStages ? { mode: "normal", commentRequired: true, stages: intermediateStages }
+      : options.stage || options.liveCycleWithRemovedStage ? { mode: "normal", commentRequired: true,
         stages: [{ id: stageId, type: "review", approvalsNeeded: 1, participants: [participant] }],
-        ...(options.monitor ? { monitor: { nextCheckAt: nextCheckAt.toISOString(), notes: "Check the deploy.", scheduledBy: "assignee" } } : {}) } } : {}),
+        ...(options.monitor ? { monitor: { nextCheckAt: nextCheckAt.toISOString(), notes: "Check the deploy.", scheduledBy: "assignee" } } : {}) }
+      : {};
+    await db.insert(issues).values({ id: issueId, companyId, title: "Build the site", status: options.intermediateApproval ? "in_review" : "in_progress", assigneeAgentId: agentId,
+      ...(Object.keys(executionPolicy).length ? { executionPolicy } : {}),
+      ...(options.intermediateApproval ? { executionState: { status: "pending", currentStageId: nextStageId, currentStageIndex: 1,
+        currentStageType: "approval", currentParticipant: { type: "agent", agentId: options.sameAgentNextStage ? agentId : reviewerAgentId }, returnAssignee: { type: "agent", agentId },
+        completedStageIds: [stageId], lastDecisionId: decisionId, lastDecisionOutcome: "approved" } } : {}),
       ...(options.monitor ? { monitorNextCheckAt: nextCheckAt } : {}),
       ...(options.liveCycleWithRemovedStage ? { executionState: { status: "changes_requested", currentStageId: randomUUID(), currentStageIndex: 0,
         currentStageType: "review", currentParticipant: { type: "user", userId: reviewerId }, returnAssignee: { type: "agent", agentId },
@@ -45,6 +56,9 @@ describe.skipIf(!support.supported)("native completion with a configured review 
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, nativeIssueId: issueId, status: "running",
       runtimeMode: "native", contextSnapshot: { issueId } });
     await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    if (options.intermediateApproval) await db.insert(issueExecutionDecisions).values({ id: decisionId!, companyId, issueId,
+      stageId, stageType: "review", actorAgentId: agentId, actorUserId: null, outcome: "approved",
+      body: "Approved the first stage.", createdByRunId: options.intermediateApprovalOwnedByRun === false ? null : runId });
     const contractId = randomUUID(), sessionId = randomUUID(), runnerId = randomUUID(), contractSha256 = `contract-${runId}`;
     await db.insert(completionContracts).values({ id: contractId, companyId, issueId, revision: 1,
       schemaVersion: "paperclip.completion-contract.v1", policyVersion: "test", risk: "standard",
@@ -81,7 +95,7 @@ describe.skipIf(!support.supported)("native completion with a configured review 
     const [task] = await db.select().from(issues).where(eq(issues.id, issueId));
     const decisions = await db.select().from(statusDecisions).where(eq(statusDecisions.issueId, issueId));
     const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
-    return { task: task!, decisions, wakes, reviewerId, reviewerAgentId, stageId, agentId, companyId, issueId };
+    return { task: task!, decisions, wakes, reviewerId, reviewerAgentId, stageId, agentId, companyId, issueId, runId };
   }
 
   it("closes verified work on a task without a configured review stage", async () => {
@@ -137,6 +151,43 @@ describe.skipIf(!support.supported)("native completion with a configured review 
     expect(r.task.executionState).toMatchObject({ status: "pending", currentParticipant: { type: "agent", agentId: r.reviewerAgentId } });
     expect(r.wakes.filter(wake => wake.reason === "execution_review_requested"))
       .toEqual([expect.objectContaining({ agentId: r.reviewerAgentId, status: "queued" })]);
+  });
+
+  it("hands an approved intermediate stage to the next agent once during native finalization, including replay", async () => {
+    const r = await finishVerifiedDone({ intermediateApproval: true });
+    expect(r.task).toMatchObject({ status: "in_review", assigneeAgentId: r.reviewerAgentId, assigneeUserId: null });
+    expect(r.task.executionState).toMatchObject({ status: "pending", currentStageIndex: 1,
+      currentParticipant: { type: "agent", agentId: r.reviewerAgentId }, completedStageIds: [r.stageId],
+      lastDecisionOutcome: "approved" });
+    const curatorWakes = r.wakes.filter(wake => wake.agentId === r.reviewerAgentId && wake.reason === "execution_approval_requested");
+    expect(curatorWakes).toHaveLength(1);
+
+    await finalizeNativeRun({ db, runId: r.runId, workspaceFinalizeStatus: "succeeded" });
+    const wakesAfterReplay = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, r.companyId));
+    expect(wakesAfterReplay.filter(wake => wake.agentId === r.reviewerAgentId && wake.reason === "execution_approval_requested")).toHaveLength(1);
+  });
+
+  it("finishes the approving run when the same agent owns the next stage, then wakes it once", async () => {
+    const r = await finishVerifiedDone({ intermediateApproval: true, sameAgentNextStage: true,
+      beforeFinish: async (runId, result) => {
+        await expect(nativeCompletionFeedback(db, runId, result)).resolves.not.toContain("active approval participant");
+      } });
+    expect(r.task.status).toBe("in_review");
+    expect(r.task.assigneeAgentId).toBe(r.agentId);
+    expect(r.task.executionState).toMatchObject({ status: "pending", currentStageIndex: 1, currentStageType: "approval",
+      currentParticipant: { type: "agent", agentId: r.agentId } });
+    const wakes = r.wakes.filter(wake => wake.agentId === r.agentId && wake.reason === "execution_approval_requested");
+    expect(wakes).toHaveLength(1);
+    await finalizeNativeRun({ db, runId: r.runId, workspaceFinalizeStatus: "succeeded" });
+    const wakesAfterReplay = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, r.companyId));
+    expect(wakesAfterReplay.filter(wake => wake.agentId === r.agentId && wake.reason === "execution_approval_requested")).toHaveLength(1);
+  });
+
+  it("keeps an ordinary pending stage gated when its approval was not recorded by the finishing run", async () => {
+    const r = await finishVerifiedDone({ intermediateApproval: true, intermediateApprovalOwnedByRun: false });
+    expect(r.task).toMatchObject({ status: "in_review", assigneeAgentId: r.agentId });
+    expect(r.decisions.map(row => row.reasonCode)).toEqual(["governed_gate_pending"]);
+    expect(r.wakes.filter(wake => wake.agentId === r.reviewerAgentId && wake.reason === "execution_approval_requested")).toEqual([]);
   });
 
   it("keeps the task open when the policy refuses Done for a live review cycle", async () => {

@@ -60,10 +60,14 @@ export async function pendingNativeGovernance(input: {
   runId: string;
   executionState: Record<string, unknown> | null;
   ignoredInteractionIds?: string[];
+  /** Set only after validating this run's saved intermediate-stage approval. */
+  approvedExecutionStageHandoffDecisionId?: string;
 }): Promise<NativeGovernanceGate | null> {
   // Execution policy is issue-owned state and takes priority over the two
-  // durable review surfaces. Completion must mediate all three authorities.
-  if (record(input.executionState).status === "pending") {
+  // durable review surfaces. The sole exception is a handoff whose approval
+  // and current run ownership were verified by native finalization and are
+  // rechecked under the issue lock by the status committer.
+  if (record(input.executionState).status === "pending" && !input.approvedExecutionStageHandoffDecisionId) {
     return { kind: "execution_stage", id: input.runId };
   }
   const [pendingInteraction, pendingApproval] = await Promise.all([

@@ -41,6 +41,7 @@ import {
   completionContracts,
   heartbeatRuns,
   issueApprovals,
+  issueExecutionDecisions,
   issueRecoveryActions,
   issueThreadInteractions,
   issues,
@@ -76,7 +77,7 @@ import {
   resolveExternalChatResponseWaitAuthorizationInTransaction,
 } from "./chat-attachment-reuse.js";
 import { issueService } from "../issues.js";
-import { COMPLETION_REVIEW_STAGE_REASON, COMPLETION_REVIEW_STAGE_REJECTED_REASON, completionReviewStageEntry } from "../issue-execution-policy.js";
+import { COMPLETION_REVIEW_STAGE_REASON, COMPLETION_REVIEW_STAGE_REJECTED_REASON, completionReviewStageEntry, parseIssueExecutionState } from "../issue-execution-policy.js";
 import { companySkillService } from "../company-skills.js";
 import { syncRoutineRunStatusForIssue } from "../routine-run-status.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
@@ -1689,6 +1690,7 @@ export async function commitNativeStatusDecision(input: {
   priorStatusVersion: number;
   priorDecisionId: string | null;
   decision: NativeStatusDecision;
+  requireExecutionStageHandoffDecisionId?: string;
   failpoint?: NativeStatusCommitFailpoint;
   preMaterializedEffects?: NativeMaterializedStatusEffect[];
   supersedesCommittedDecisionId?: string;
@@ -1778,6 +1780,31 @@ export async function commitNativeStatusDecision(input: {
     if (!issue) throw new NativeStatusRaceError();
     const [originRun] = await tx.select({ agentId: heartbeatRuns.agentId }).from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId)));
+    if (input.requireExecutionStageHandoffDecisionId) {
+      const executionState = record(issue.executionState);
+      const [approvalDecision] = await tx.select({ id: issueExecutionDecisions.id, stageId: issueExecutionDecisions.stageId })
+        .from(issueExecutionDecisions).where(and(
+          eq(issueExecutionDecisions.id, input.requireExecutionStageHandoffDecisionId),
+          eq(issueExecutionDecisions.companyId, input.companyId),
+          eq(issueExecutionDecisions.issueId, input.issueId),
+          eq(issueExecutionDecisions.outcome, "approved"),
+          eq(issueExecutionDecisions.actorAgentId, originRun?.agentId ?? ""),
+          eq(issueExecutionDecisions.createdByRunId, input.runId),
+        )).limit(1).for("share", { noWait: true });
+      const completedStageIds = Array.isArray(executionState.completedStageIds) ? executionState.completedStageIds : [];
+      if (input.decision.reasonCode !== COMPLETION_REVIEW_STAGE_REASON ||
+          issue.executionRunId !== input.runId || issue.assigneeAgentId !== originRun?.agentId || issue.assigneeUserId !== null ||
+          executionState.status !== "pending" || executionState.lastDecisionId !== input.requireExecutionStageHandoffDecisionId ||
+          executionState.lastDecisionOutcome !== "approved" || typeof executionState.currentStageId !== "string" ||
+          !approvalDecision || approvalDecision.stageId === executionState.currentStageId || !completedStageIds.includes(approvalDecision.stageId)) {
+        throw new NativeStatusRaceError();
+      }
+      await lockNativeGovernanceSources({ db: tx as unknown as Db, companyId: input.companyId, issueId: input.issueId });
+      const otherGate = await pendingNativeGovernance({ db: tx as unknown as Db, companyId: input.companyId,
+        issueId: input.issueId, runId: input.runId, executionState,
+        approvedExecutionStageHandoffDecisionId: input.requireExecutionStageHandoffDecisionId });
+      if (otherGate) throw new NativeStatusRaceError();
+    }
     if (input.requireReassessmentSource) {
       const expected = input.requireReassessmentSource;
       const now = Date.now();
@@ -2394,8 +2421,13 @@ export async function commitNativeStatusDecision(input: {
       failAt("status_projection", input.failpoint);
       // Start the configured review stage from the locked task, as the issue
       // route does; a changed policy makes the saved decision stale.
-      const reviewStage = input.decision.reasonCode === COMPLETION_REVIEW_STAGE_REASON
+      const computedReviewStage = input.decision.reasonCode === COMPLETION_REVIEW_STAGE_REASON
         ? completionReviewStageEntry(issue, originRun?.agentId ?? "") : null;
+      const deferredHandoffState = computedReviewStage?.kind === "rejected" && input.requireExecutionStageHandoffDecisionId
+        ? parseIssueExecutionState(issue.executionState) : null;
+      const reviewStage = deferredHandoffState
+        ? { kind: "starts" as const, patch: { status: "in_review", executionState: deferredHandoffState }, state: deferredHandoffState }
+        : computedReviewStage;
       if (reviewStage && reviewStage.kind !== "starts") throw new NativeStatusRaceError();
       const projected = await issueService(tx as unknown as Db).update(
         input.issueId,

@@ -43,7 +43,7 @@ import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./
 import { toolCallLoopContinuationKey } from "./repeated-tool-failure-guard.js";
 import { conversationNativeDecision, isConversation, settleConversationTurnForRun } from "../agent-conversations.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
-import { COMPLETION_REVIEW_STAGE_REASON, completionReviewStageEntry } from "../issue-execution-policy.js";
+import { COMPLETION_REVIEW_STAGE_REASON, completionReviewStageEntry, parseIssueExecutionState } from "../issue-execution-policy.js";
 import { randomUUID } from "node:crypto";
 import { preserveNativeWorkspaceExportLease } from "./native-workspace-export-resume.js";
 import { and, desc, eq, gt, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
@@ -122,6 +122,7 @@ import {
   nativeRunnerOwnershipNotHeldCondition,
 } from "./native-runner-ownership.js";
 import { crashPoint } from "@paperclipai/shared/crash-points";
+import { executionStageHandoffApprovedByRun } from "./native-execution-stage-handoff.js";
 
 function record(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -1653,6 +1654,7 @@ export async function finalizeNativeRun(input: {
           })
         : "not_applicable";
     const monitorWaitAt = scheduledIssueMonitorWait(authoritativeIssue, run.agentId);
+    const reviewContext = readNativeReviewAssignmentContext(run.contextSnapshot);
     const preservedMonitorWait = terminalState === "succeeded" && input.workspaceFinalizeStatus === "succeeded" &&
       assessment.reportedDisposition === "yielded" && assessment.continuation?.kind === "monitor"
       ? await readNativePreservedMonitorWait(input.db, {
@@ -1666,6 +1668,9 @@ export async function finalizeNativeRun(input: {
       ? await findSupersededExternalReviewRequests(input.db, {
         companyId: run.companyId, issueId: authoritativeIssue.id, runId: run.id, agentId: run.agentId,
       }) : [];
+    const approvedExecutionStageHandoffDecisionId = terminalState === "succeeded" &&
+      input.workspaceFinalizeStatus === "succeeded" && !reviewContext
+      ? await executionStageHandoffApprovedByRun(input.db, run, authoritativeIssue) : null;
     const governanceGate = await pendingNativeGovernance({
       db: input.db,
       companyId: run.companyId,
@@ -1673,6 +1678,8 @@ export async function finalizeNativeRun(input: {
       runId: run.id,
       executionState: record(authoritativeIssue.executionState),
       ignoredInteractionIds: supersededReviews.map(({ interaction }) => interaction.id),
+      ...(approvedExecutionStageHandoffDecisionId
+        ? { approvedExecutionStageHandoffDecisionId } : {}),
     });
     const boardResponseWaitOrigin =
       externalChatResponseWaitAuthorization === "not_applicable" &&
@@ -1712,7 +1719,6 @@ export async function finalizeNativeRun(input: {
           )
         : Promise.resolve(null),
     ]);
-    const reviewContext = readNativeReviewAssignmentContext(run.contextSnapshot);
     const nativeReview = reviewContext ? await getNativeReviewAssignment(input.db, {
       companyId: run.companyId, issueId: authoritativeIssue.id, agentId: run.agentId,
       contextSnapshot: reviewContext, allowResolvedByRunId: run.id,
@@ -1754,8 +1760,13 @@ export async function finalizeNativeRun(input: {
     const qualityReview = await readRequiredQualityReview(input.db, authoritativeIssue);
     // The configured review stage a completion would start, decided as the
     // issue route decides `status: "done"`. Review runs keep their own path.
+    const handoffState = approvedExecutionStageHandoffDecisionId
+      ? parseIssueExecutionState(authoritativeIssue.executionState) : null;
     const reviewStage = isConversation(authoritativeIssue) || reviewContext
-      ? { kind: "none" as const } : completionReviewStageEntry(authoritativeIssue, run.agentId);
+      ? { kind: "none" as const }
+      : handoffState
+        ? { kind: "starts" as const, patch: { status: "in_review", executionState: handoffState }, state: handoffState }
+        : completionReviewStageEntry(authoritativeIssue, run.agentId);
     await cancelStoppedRunContinuation(input.db, { companyId: run.companyId, resultJson: savedStop }, toolCallLoopContinuationKey(run.id));
     const statusInput: Parameters<typeof resolveNativeFinalizerStatus>[0] = {
       requiredQualityReviewSatisfied: qualityReview.satisfied,
@@ -1920,6 +1931,8 @@ export async function finalizeNativeRun(input: {
         priorStatusVersion: Number(authoritativeIssue.statusVersion),
         priorDecisionId: authoritativeIssue.lastStatusDecisionId,
         decision,
+        ...(approvedExecutionStageHandoffDecisionId && decision.reasonCode === COMPLETION_REVIEW_STAGE_REASON
+          ? { requireExecutionStageHandoffDecisionId: approvedExecutionStageHandoffDecisionId } : {}),
         requirePreservedResultFinalization: preservedResultFinalization ?? undefined,
         supersededExternalReviewRequests: supersededReviews.length && !governanceGate &&
           ["completion_claim_policy_accepted", "completion_contract_satisfied", "external_chat_response_waiting", "scheduled_monitor_waiting"].includes(decision.reasonCode ?? "")
