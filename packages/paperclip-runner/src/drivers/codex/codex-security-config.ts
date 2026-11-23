@@ -3,6 +3,7 @@ import { CERTIFICATE_ENVIRONMENT_KEYS, configuredEnvironmentKeys } from "../../c
 import { resolve, isAbsolute, join, dirname, delimiter, relative, sep } from "node:path";
 import { closeSync, constants, existsSync, fstatSync, openSync, realpathSync, readFileSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
+import { execFileSync } from "node:child_process";
 import { QUALIFIED_ACPX_PROFILES } from "../acpx/qualified-profiles.js";
 
 import {
@@ -258,6 +259,38 @@ function tomlString(value: string): string {
 
 export const CODEX_UPDATE_PLAN_TOOL_CONFIG = "tools.update_plan.enabled=true";
 
+const XCODE_APP = "/Applications/Xcode.app";
+const XCODE_FRAMEWORKS = "/Library/Developer/PrivateFrameworks";
+
+interface MacosXcodeBuildAccess {
+  temporaryDirectory: string;
+}
+
+/** Only a host operator can opt a managed worktree parent into Xcode access. */
+export function resolveMacosXcodeBuildAccess(workingDirectory?: string): MacosXcodeBuildAccess | undefined {
+  const parent = process.env.PAPERCLIP_MACOS_XCODE_WORKTREE_PARENT?.trim();
+  if (process.platform !== "darwin" || !parent || !isAbsolute(parent) || !workingDirectory) return;
+  try {
+    const root = realpathSync(parent);
+    const workspace = realpathSync(workingDirectory);
+    if (root === "/" || workspace === root || !codexPathInside(root, workspace)) return;
+    if (!statSync(join(workspace, ".git")).isFile() || !existsSync(join(XCODE_APP, "Contents/Developer/usr/bin/xcodebuild"))) return;
+    const temporaryDirectory = realpathSync(execFileSync("/usr/bin/getconf", ["DARWIN_USER_TEMP_DIR"], {
+      encoding: "utf8",
+      env: {},
+      timeout: 1000,
+      maxBuffer: 1024,
+    }).trim());
+    const stat = statSync(temporaryDirectory);
+    if (!/^\/private\/var\/folders\/[^/]+\/[^/]+\/T$/.test(temporaryDirectory)
+      || !stat.isDirectory() || stat.uid !== process.getuid?.()) return;
+    return { temporaryDirectory };
+  } catch {
+    // An invalid or unavailable host resource must not widen the sandbox.
+    return;
+  }
+}
+
 export function createIsolatedCodexAppServerArgs(
   source: NodeJS.ProcessEnv | undefined = undefined,
   readOnlyRoots: string[] = [],
@@ -265,6 +298,7 @@ export function createIsolatedCodexAppServerArgs(
   instructionWorkingCopyRoot?: string,
   protectedPaths: string[] = [],
   disableWebSearch = false,
+  requestedXcodeBuildAccess?: MacosXcodeBuildAccess,
 ): string[] {
   const explicitSource = source;
   source ??= process.env;
@@ -272,6 +306,7 @@ export function createIsolatedCodexAppServerArgs(
   readOnlyRoots = [...new Set([...readOnlyRoots, ...codexNetworkReadOnlyRoots(source)])];
   const networkAccess = codexNetworkAccess(source);
   const externalRunnerSandbox = usesExternalRunnerSandbox(source);
+  const xcodeBuildAccess = externalRunnerSandbox ? undefined : requestedXcodeBuildAccess;
   const inheritedEnvironmentKeys = [
     // Certificate-trust names stay inheritable: sandboxes inject their values
     // into the execution environment after this policy is constructed.
@@ -285,6 +320,7 @@ export function createIsolatedCodexAppServerArgs(
   const commandEnvironment = codexCommandEnvironment(source);
   // Selected task values are inherited, never serialized into configuration argv.
   for (const key of configuredEnvironmentKeys(explicitSource)) delete commandEnvironment[key];
+  if (xcodeBuildAccess) commandEnvironment.DEVELOPER_DIR = join(XCODE_APP, "Contents/Developer");
   if (instructionWorkingCopyRoot && source.AGENT_HOME === instructionWorkingCopyRoot) commandEnvironment.AGENT_HOME = instructionWorkingCopyRoot;
   const shellEnvironmentKeys = [...new Set([...inheritedEnvironmentKeys, ...Object.keys(commandEnvironment)])].sort();
   if (source.PAPERCLIP_GITHUB_LAUNCHER_DIR) readOnlyRoots = [...readOnlyRoots, source.PAPERCLIP_GITHUB_LAUNCHER_DIR];
@@ -311,7 +347,12 @@ export function createIsolatedCodexAppServerArgs(
   const filesystemRules = [
     `":root"="none"`,
     `":minimal"="read"`,
-    `":tmpdir"="none"`,
+    // An explicit :tmpdir deny would override the same canonical macOS path.
+    ...(xcodeBuildAccess ? [
+      `${tomlString(XCODE_APP)}="read"`,
+      `${tomlString(XCODE_FRAMEWORKS)}="read"`,
+      `${tomlString(xcodeBuildAccess.temporaryDirectory)}="write"`,
+    ] : [`":tmpdir"="none"`]),
     ...deniedHostRoots.map((path) => `${tomlString(path)}="none"`),
     ...protectedPaths.map((path) => `${tomlString(resolve(path))}="none"`),
     ...(usesPreconfiguredHome(source) && source.HOME ? [`${tomlString(source.HOME)}="write"`] : []),

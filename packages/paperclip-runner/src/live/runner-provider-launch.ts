@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { parseNativeRuntimeContext, retargetNativeSystemInstructions } from "../contracts/runtime-context.js";
 import { resolve } from "node:path";
-import { codexExecutableReadOnlyRoots } from "../drivers/codex/codex-security-config.js";
+import { codexExecutableReadOnlyRoots, resolveMacosXcodeBuildAccess } from "../drivers/codex/codex-security-config.js";
 import { createIsolatedCodexAppServerArgs } from "../drivers/codex/codex-app-server-driver.js";
 import { validatePreparedLaunchWorkingDirectory } from "../drivers/codex/codex-boundaries.js";
 import { usesPreconfiguredHome } from "../drivers/preconfigured-home.js";
@@ -507,6 +507,8 @@ export function createRunnerdCodexAppServerArgs(input: {
       [...(input.readOnlyRoots ?? []), ...codexExecutableReadOnlyRoots(input.environment ?? {}, input.codexCommand)],
       input.instructionWorkingCopyRoot,
       usesPreconfiguredHome(input.environment) && input.runtimeStateRoot ? [input.runtimeStateRoot] : [],
+      false,
+      resolveMacosXcodeBuildAccess(input.workingDirectory),
     ),
   ];
   if (!input.args && usesPreconfiguredHome(input.environment) && input.workingDirectory) {

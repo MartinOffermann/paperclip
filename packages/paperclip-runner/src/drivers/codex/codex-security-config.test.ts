@@ -272,6 +272,33 @@ describe("Codex security configuration", () => {
     });
   });
 
+  it("grants opted-in Xcode access only in the local writable profile", () => {
+    const temporaryDirectory = "/private/var/folders/ab/runner/T";
+    const access = { temporaryDirectory };
+    const args = createIsolatedCodexAppServerArgs({ HOME: "/runner" }, [], undefined, [], false, access);
+    const filesystem = args.filter((arg) => arg.startsWith("permissions.") && arg.includes(".filesystem="));
+    const write = filesystem.find((arg) => arg.includes(".paperclip-runner-workspace-only."));
+    const planning = filesystem.find((arg) => arg.includes(".paperclip-runner-workspace-read-only."));
+    expect(write).toContain('"/Applications/Xcode.app"="read"');
+    expect(write).toContain('"/Library/Developer/PrivateFrameworks"="read"');
+    expect(write).toContain(`"${temporaryDirectory}"="write"`);
+    expect(write).not.toContain('":tmpdir"="none"');
+    expect(planning).toContain('":tmpdir"="none"');
+    expect(planning).not.toContain(temporaryDirectory);
+    expect(planning).not.toContain("/Library/Developer/PrivateFrameworks");
+    expect(args.join("\n")).toContain('DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer"');
+
+    for (const [environment, grant] of [
+      [{ HOME: "/runner" }, undefined],
+      [{ HOME: "/runner", PAPERCLIP_RUNNER_EXTERNAL_SANDBOX: "1" }, access],
+    ] as const) {
+      const other = createIsolatedCodexAppServerArgs(environment, [], undefined, [], false, grant).join("\n");
+      expect(other).toContain('":tmpdir"="none"');
+      expect(other).not.toContain(temporaryDirectory);
+      expect(other).not.toContain("DEVELOPER_DIR=");
+    }
+  });
+
   it("allows only the registered private instruction directory while keeping shared context read-only", () => {
     const args = createIsolatedCodexAppServerArgs({ HOME: "/host/home" }, ["/runtime/immutable-context"], "/runtime/instruction-edits/run-1").join("\n");
     expect(args).toContain('"/runtime/instruction-edits/run-1"="write"');
