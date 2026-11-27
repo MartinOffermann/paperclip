@@ -43,35 +43,34 @@ export async function uninstallCommand(
   const detect = dependencies.detectServiceManager ?? detectServiceManager;
   const platform = dependencies.platform ?? process.platform;
   const userHomeDir = dependencies.userHomeDir ?? os.homedir();
-  const detection = await detect({ instanceId, platform });
   const otherDefinitions = otherServiceDefinitions(platform, userHomeDir, instanceId);
   if (otherDefinitions.length > 0) {
     throw new Error(`Cannot remove the shared managed CLI while other instance services are installed: ${otherDefinitions.join(", ")}. Uninstall those services first.`);
   }
-  if (!detection.supported && platform === "linux") {
-    const definitionPath = path.join(
-      userHomeDir,
-      ".config",
-      "systemd",
-      "user",
-      systemdServiceName(instanceId),
-    );
-    if (fs.existsSync(definitionPath)) {
-      throw new Error(
-        `Cannot verify or remove the background service: ${detection.reason}. Retry when the service manager is available.`,
-      );
-    }
-  }
-  if (detection.supported) {
-    const status = await detection.manager.status();
-    if (status.installed || status.active) await detection.manager.uninstall();
-  }
-
   const paths = resolveInstallStorePaths();
   const hadStore = fs.existsSync(paths.cliRoot);
   if (hadStore) assertManagedInstallStore(paths);
   const shimRemoved = await withInstallStoreLock(async () => {
-    if (hadStore) assertManagedInstallStore(paths);
+    const hasManifest = fs.existsSync(paths.manifestPath);
+    if (hadStore || hasManifest) assertManagedInstallStore(paths);
+    try {
+      const detection = await detect({ instanceId, platform });
+      if (detection.supported) {
+        const status = await detection.manager.status();
+        if (status.installed || status.active) await detection.manager.uninstall();
+      } else if (platform === "linux") {
+        const definitionPath = path.join(userHomeDir, ".config", "systemd", "user", systemdServiceName(instanceId));
+        if (fs.existsSync(definitionPath)) {
+          throw new Error(
+            `Cannot verify or remove the background service: ${detection.reason}. Retry when the service manager is available.`,
+          );
+        }
+      }
+    } catch (error) {
+      // A service-only uninstall creates a temporary store to take the lock.
+      if (!hadStore && !hasManifest) fs.rmSync(paths.cliRoot, { recursive: true, force: true });
+      throw error;
+    }
     const removed = removeManagedShim(paths);
 
     const home = process.env.HOME;
