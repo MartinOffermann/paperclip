@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { parseNativeRuntimeContext, retargetNativeSystemInstructions } from "../contracts/runtime-context.js";
 import { resolve } from "node:path";
-import { codexExecutableReadOnlyRoots, resolveMacosXcodeBuildAccess } from "../drivers/codex/codex-security-config.js";
+import { codexExecutableReadOnlyRoots, resolveMacosGitAccess, resolveMacosXcodeBuildAccess } from "../drivers/codex/codex-security-config.js";
 import { createIsolatedCodexAppServerArgs } from "../drivers/codex/codex-app-server-driver.js";
 import { validatePreparedLaunchWorkingDirectory } from "../drivers/codex/codex-boundaries.js";
 import { usesPreconfiguredHome } from "../drivers/preconfigured-home.js";
@@ -509,6 +509,8 @@ export function createRunnerdCodexAppServerArgs(input: {
       usesPreconfiguredHome(input.environment) && input.runtimeStateRoot ? [input.runtimeStateRoot] : [],
       false,
       resolveMacosXcodeBuildAccess(input.workingDirectory),
+      input.environment?.PAPERCLIP_RUNNER_EXTERNAL_SANDBOX === "1"
+        ? undefined : resolveMacosGitAccess(input.workingDirectory),
     ),
   ];
   if (!input.args && usesPreconfiguredHome(input.environment) && input.workingDirectory) {

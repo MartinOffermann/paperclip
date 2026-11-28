@@ -25,6 +25,19 @@ The canonical name list is `CERTIFICATE_ENVIRONMENT_KEYS` in
 `packages/paperclip-runner/src/configured-environment.ts`; the legacy adapter
 mirror lives in `packages/adapter-utils/src/codex-shell-environment.ts`.
 
+## Native macOS Git in worktrees
+
+For local native Codex launches whose working directory is a Git repository,
+the Runner resolves Git from the host's selected Apple developer directory
+before starting Codex. It puts that direct executable's `usr/bin` first in the
+shell `PATH` and grants read access to that `usr/bin` directory, Git's
+`usr/libexec/git-core` helper directory, and the optional
+`usr/share/git-core/gitconfig` and `gitattributes` files. Worktree and Git
+metadata write access continues to come from the existing workspace and Git
+metadata grants. The planning profile receives the same Git tool read access
+while keeping the workspace read-only. This does not enable the opt-in Xcode
+build profile below.
+
 ## Opt in to Xcode builds on macOS
 
 Set `PAPERCLIP_MACOS_XCODE_WORKTREE_PARENT` in the Paperclip host service

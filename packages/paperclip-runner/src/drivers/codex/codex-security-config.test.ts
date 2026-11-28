@@ -1,9 +1,10 @@
 import { CERTIFICATE_ENVIRONMENT_KEYS } from "../../configured-environment.js";
 import { createRequire } from "node:module";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { resolvePinnedCodexCommand } from "./codex-command.js";
 import { evalProviderTransportOptions } from "../../cli/eval-provider-runtime.js";
 import { describe, expect, it } from "vitest";
@@ -16,6 +17,7 @@ import {
   createIsolatedCodexAppServerArgs,
   createSecuredCodexThreadParams,
   createSkilllessCodexThreadConfig,
+  resolveMacosGitAccess,
 } from "./codex-security-config.js";
 
 describe("Codex security configuration", () => {
@@ -297,6 +299,57 @@ describe("Codex security configuration", () => {
       expect(other).not.toContain(temporaryDirectory);
       expect(other).not.toContain("DEVELOPER_DIR=");
     }
+  });
+
+  it("resolves the selected macOS Git directly and keeps its toolchain read-only in planning", () => {
+    const gitAccess = {
+      executable: "/Library/Developer/CommandLineTools/usr/bin/git",
+      binaryDirectory: "/Library/Developer/CommandLineTools/usr/bin",
+      readOnlyRoots: [
+        "/Library/Developer/CommandLineTools/usr/bin",
+        "/Library/Developer/CommandLineTools/usr/libexec/git-core",
+        "/Library/Developer/CommandLineTools/usr/share/git-core/gitconfig",
+        "/Library/Developer/CommandLineTools/usr/share/git-core/gitattributes",
+      ],
+    };
+    const args = createIsolatedCodexAppServerArgs({ HOME: "/runner", PATH: "/usr/bin:/bin" }, [], undefined, [], false, undefined, gitAccess);
+    const writable = args.find(arg => arg.startsWith("permissions.paperclip-runner-workspace-only.filesystem="))!;
+    const planning = args.find(arg => arg.startsWith("permissions.paperclip-runner-workspace-read-only.filesystem="))!;
+    expect(args.join("\n")).toContain('PATH="/Library/Developer/CommandLineTools/usr/bin:/usr/bin:/bin"');
+    expect(writable).toContain('"/Library/Developer/CommandLineTools/usr/share/git-core/gitconfig"="read"');
+    expect(writable).toContain('"/Library/Developer/CommandLineTools/usr/share/git-core/gitattributes"="read"');
+    expect(writable).not.toContain('"/Library/Developer/CommandLineTools/usr"="read"');
+    expect(writable).not.toContain('"/Library/Developer/CommandLineTools/usr"="write"');
+    expect(planning).toContain('"/Library/Developer/CommandLineTools/usr/share/git-core/gitconfig"="read"');
+    expect(planning).toContain('"/Library/Developer/CommandLineTools/usr/share/git-core/gitattributes"="read"');
+    expect(planning).not.toContain('"/Library/Developer/CommandLineTools/usr"="write"');
+    expect(planning).toContain('":workspace_roots"={"."="read"}');
+
+    const external = createIsolatedCodexAppServerArgs({
+      HOME: "/runner", PATH: "/usr/bin:/bin", PAPERCLIP_RUNNER_EXTERNAL_SANDBOX: "1",
+    }, [], undefined, [], false, undefined, gitAccess).join("\n");
+    expect(external).not.toContain("/Library/Developer/CommandLineTools/usr/bin");
+    expect(external).not.toContain("/Library/Developer/CommandLineTools/usr\"");
+  });
+
+  it("resolves macOS Git only for a local Git working directory", () => {
+    if (process.platform !== "darwin") {
+      expect(resolveMacosGitAccess("/workspace")).toBeUndefined();
+      return;
+    }
+    const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../../../../..");
+    const access = resolveMacosGitAccess(repositoryRoot);
+    if (access) {
+      expect(access.executable).toMatch(/\/usr\/bin\/git$/);
+      expect(access.binaryDirectory).toBe(dirname(access.executable));
+      expect(access.readOnlyRoots).toContain(dirname(access.executable));
+      expect(access.readOnlyRoots).toContain("/Library/Developer/CommandLineTools/usr/libexec/git-core");
+    }
+    try {
+      const developerDirectory = execFileSync("/usr/bin/xcode-select", ["-p"], { encoding: "utf8" }).trim();
+      if (existsSync(join(developerDirectory, "usr/bin/git"))) expect(access).toBeDefined();
+    } catch { /* Hosts without selected Apple developer tools are supported. */ }
+    expect(resolveMacosGitAccess("/missing/paperclip-worktree")).toBeUndefined();
   });
 
   it("allows only the registered private instruction directory while keeping shared context read-only", () => {

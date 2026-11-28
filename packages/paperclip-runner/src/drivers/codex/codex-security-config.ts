@@ -259,6 +259,49 @@ function tomlString(value: string): string {
 
 export const CODEX_UPDATE_PLAN_TOOL_CONFIG = "tools.update_plan.enabled=true";
 
+interface MacosGitAccess {
+  executable: string;
+  binaryDirectory: string;
+  readOnlyRoots: string[];
+}
+
+/** Resolve Apple's selected Git on the host, before Codex applies its filesystem sandbox. */
+export function resolveMacosGitAccess(workingDirectory?: string): MacosGitAccess | undefined {
+  if (process.platform !== "darwin" || !workingDirectory) return;
+  try {
+    const gitEntry = statSync(join(realpathSync(workingDirectory), ".git"));
+    if (!gitEntry.isFile() && !gitEntry.isDirectory()) return;
+    const developerDirectory = realpathSync(execFileSync("/usr/bin/xcode-select", ["-p"], {
+      encoding: "utf8",
+      env: {},
+      timeout: 1000,
+      maxBuffer: 1024,
+    }).trim());
+    const toolchainRoot = realpathSync(join(developerDirectory, "usr"));
+    const executable = realpathSync(join(toolchainRoot, "bin", "git"));
+    const binaryDirectory = realpathSync(dirname(executable));
+    const execPath = realpathSync(join(toolchainRoot, "libexec", "git-core"));
+    const stat = statSync(executable);
+    if (!codexPathInside(developerDirectory, toolchainRoot)
+      || !codexPathInside(toolchainRoot, executable)
+      || !codexPathInside(toolchainRoot, binaryDirectory)
+      || !codexPathInside(toolchainRoot, execPath)
+      || !stat.isFile() || (stat.mode & 0o111) === 0
+      || !statSync(binaryDirectory).isDirectory() || !statSync(execPath).isDirectory()) return;
+    const readOnlyRoots = [binaryDirectory, execPath];
+    for (const resource of ["gitconfig", "gitattributes"]) {
+      try {
+        const path = realpathSync(join(toolchainRoot, "share", "git-core", resource));
+        if (codexPathInside(toolchainRoot, path) && statSync(path).isFile()) readOnlyRoots.push(path);
+      } catch { /* Some Apple developer toolchains omit optional Git resources. */ }
+    }
+    return { executable, binaryDirectory, readOnlyRoots: [...new Set(readOnlyRoots)] };
+  } catch {
+    // Missing or invalid Apple developer tools must not widen the sandbox.
+    return;
+  }
+}
+
 const XCODE_APP = "/Applications/Xcode.app";
 const XCODE_FRAMEWORKS = "/Library/Developer/PrivateFrameworks";
 
@@ -299,6 +342,7 @@ export function createIsolatedCodexAppServerArgs(
   protectedPaths: string[] = [],
   disableWebSearch = false,
   requestedXcodeBuildAccess?: MacosXcodeBuildAccess,
+  requestedGitAccess?: MacosGitAccess,
 ): string[] {
   const explicitSource = source;
   source ??= process.env;
@@ -307,6 +351,7 @@ export function createIsolatedCodexAppServerArgs(
   const networkAccess = codexNetworkAccess(source);
   const externalRunnerSandbox = usesExternalRunnerSandbox(source);
   const xcodeBuildAccess = externalRunnerSandbox ? undefined : requestedXcodeBuildAccess;
+  const gitAccess = externalRunnerSandbox ? undefined : requestedGitAccess;
   const inheritedEnvironmentKeys = [
     // Certificate-trust names stay inheritable: sandboxes inject their values
     // into the execution environment after this policy is constructed.
@@ -320,6 +365,11 @@ export function createIsolatedCodexAppServerArgs(
   const commandEnvironment = codexCommandEnvironment(source);
   // Selected task values are inherited, never serialized into configuration argv.
   for (const key of configuredEnvironmentKeys(explicitSource)) delete commandEnvironment[key];
+  if (gitAccess) {
+    const pathEntries = [gitAccess.binaryDirectory, commandEnvironment.PATH]
+      .filter((entry): entry is string => Boolean(entry));
+    commandEnvironment.PATH = [...new Set(pathEntries.flatMap(entry => entry.split(delimiter)).filter(Boolean))].join(delimiter);
+  }
   if (xcodeBuildAccess) commandEnvironment.DEVELOPER_DIR = join(XCODE_APP, "Contents/Developer");
   if (instructionWorkingCopyRoot && source.AGENT_HOME === instructionWorkingCopyRoot) commandEnvironment.AGENT_HOME = instructionWorkingCopyRoot;
   const shellEnvironmentKeys = [...new Set([...inheritedEnvironmentKeys, ...Object.keys(commandEnvironment)])].sort();
@@ -353,6 +403,7 @@ export function createIsolatedCodexAppServerArgs(
       `${tomlString(XCODE_FRAMEWORKS)}="read"`,
       `${tomlString(xcodeBuildAccess.temporaryDirectory)}="write"`,
     ] : [`":tmpdir"="none"`]),
+    ...(gitAccess ? gitAccess.readOnlyRoots.map(path => `${tomlString(path)}="read"`) : []),
     ...deniedHostRoots.map((path) => `${tomlString(path)}="none"`),
     ...protectedPaths.map((path) => `${tomlString(resolve(path))}="none"`),
     ...(usesPreconfiguredHome(source) && source.HOME ? [`${tomlString(source.HOME)}="write"`] : []),
@@ -376,6 +427,7 @@ export function createIsolatedCodexAppServerArgs(
     ...deniedHostRoots.map((path) => `${tomlString(path)}="none"`),
     ...protectedPaths.map((path) => `${tomlString(resolve(path))}="none"`),
     ...(usesPreconfiguredHome(source) && source.HOME ? [`${tomlString(source.HOME)}="read"`] : []),
+    ...(gitAccess ? gitAccess.readOnlyRoots.map(path => `${tomlString(path)}="read"`) : []),
     ...readOnlyRoots.map((path) => `${tomlString(resolve(path))}="read"`),
     ...generatedImageRoots.map((path) => `${tomlString(path)}="read"`),
     ...[...gitRoots.read, ...gitRoots.write].map((path) => `${tomlString(path)}="read"`),
